@@ -1,0 +1,1 @@
+python deploy_real/deploy_real_19.py enp108s0 g1_19.yaml
