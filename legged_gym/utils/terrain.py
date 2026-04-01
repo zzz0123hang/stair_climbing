@@ -82,7 +82,7 @@ class Terrain:
                                 vertical_scale=self.cfg.vertical_scale,
                                 horizontal_scale=self.cfg.horizontal_scale)
         slope = difficulty * 0.4
-        step_height = 0.09 + 0.01 * difficulty
+        step_height = 0.05 + 0.1 * difficulty
         # step_height = 0.12
         discrete_obstacles_height = 0.05 + difficulty * 0.2
         stepping_stones_size = 1.5 * (1.05 - difficulty)
@@ -99,7 +99,7 @@ class Terrain:
         elif choice < self.proportions[3]:
             if choice<self.proportions[2]:
                 step_height *= -1
-            terrain_utils.pyramid_stairs_terrain(terrain, step_width=0.31, step_height=step_height, platform_size=3.)
+            terrain_utils.pyramid_stairs_terrain(terrain, step_width=0.3, step_height=step_height, platform_size=3.)
         elif choice < self.proportions[4]:
             num_rectangles = 20
             rectangle_min_size = 1.
@@ -126,11 +126,10 @@ class Terrain:
 
         env_origin_x = (i + 0.5) * self.env_length
         env_origin_y = (j + 0.5) * self.env_width
-        x1 = int((self.env_length/2. - 1) / terrain.horizontal_scale)
-        x2 = int((self.env_length/2. + 1) / terrain.horizontal_scale)
-        y1 = int((self.env_width/2. - 1) / terrain.horizontal_scale)
-        y2 = int((self.env_width/2. + 1) / terrain.horizontal_scale)
-        env_origin_z = np.max(terrain.height_field_raw[x1:x2, y1:y2])*terrain.vertical_scale
+        # Use the exact center point height instead of max of 2m x 2m region
+        center_x = terrain.height_field_raw.shape[0] // 2
+        center_y = terrain.height_field_raw.shape[1] // 2
+        env_origin_z = terrain.height_field_raw[center_x, center_y] * terrain.vertical_scale
         self.env_origins[i, j] = [env_origin_x, env_origin_y, env_origin_z]
 
 def gap_terrain(terrain, gap_size, platform_size=1.):

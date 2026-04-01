@@ -1,1 +1,1 @@
-python3 legged_gym/scripts/train.py --resume --headless --task=g1 --run_name v2 --load_run /home/zzz/unitree_rl_gym/logs/g1/Dec23_13-59-17_v1
+python3 legged_gym/scripts/train.py --resume --headless --task=g1 --load_run /home/zzz/unitree_rl_gym/logs/g1/Mar10_17-08-46_TS_S_Climbing

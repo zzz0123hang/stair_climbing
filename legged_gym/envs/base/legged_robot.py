@@ -98,6 +98,11 @@ class LeggedRobot(BaseTask):
         self.base_ang_vel[:] = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
         self.projected_gravity[:] = quat_rotate_inverse(self.base_quat, self.gravity_vec)
 
+        # 记录本回合“已到达的最远距离”（用于课程升级判定）
+        if hasattr(self, "episode_start_xy") and hasattr(self, "episode_max_distance"):
+            cur_distance = torch.norm(self.root_states[:, :2] - self.episode_start_xy, dim=1)
+            self.episode_max_distance = torch.maximum(self.episode_max_distance, cur_distance)
+
         self._post_physics_step_callback()
 
         # compute observations, rewards, resets, ...
@@ -136,9 +141,22 @@ class LeggedRobot(BaseTask):
         if len(env_ids) == 0:
             return
         
+        # ================= [核心补丁] 激活课程学习 =================
+        # 1. 更新地形课程：根据表现让机器人去更难的地形
+        if self.cfg.terrain.curriculum:
+            self._update_terrain_curriculum(env_ids)
+        # 2. 更新命令课程：根据表现增加指令速度上限
+        if self.cfg.commands.curriculum:
+            self.update_command_curriculum(env_ids)
+
         # reset robot states
         self._reset_dofs(env_ids)
         self._reset_root_states(env_ids)
+        # 记录新回合起点，并清空“本回合最远距离”
+        if hasattr(self, "episode_start_xy"):
+            self.episode_start_xy[env_ids] = self.root_states[env_ids, :2]
+        if hasattr(self, "episode_max_distance"):
+            self.episode_max_distance[env_ids] = 0.0
 
         self._resample_commands(env_ids)
 
@@ -154,11 +172,9 @@ class LeggedRobot(BaseTask):
         for key in self.episode_sums.keys():
             self.extras["episode"]['rew_' + key] = torch.mean(self.episode_sums[key][env_ids]) / self.max_episode_length_s
             self.episode_sums[key][env_ids] = 0.
-        if self.cfg.commands.curriculum:
-            self.extras["episode"]["max_command_x"] = self.command_ranges["lin_vel_x"][1]
-        # send timeout info to the algorithm
         if self.cfg.env.send_timeouts:
             self.extras["time_outs"] = self.time_out_buf
+        
     
     def compute_reward(self):
         """ Compute rewards
@@ -382,7 +398,98 @@ class LeggedRobot(BaseTask):
                                                     gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
 
    
-    
+    def _update_terrain_curriculum(self, env_ids):
+        """ 
+        [修复版] 根据机器人实际行进的相对距离调整难度。
+        解决因 init_state.pos 偏移导致的虚假进阶问题。
+        """
+        if not self.init_done:
+            return
+        
+        # 1. 终点位移（用于降级稳定性判定）
+        final_distance = torch.norm(self.root_states[env_ids, :2] - self.episode_start_xy[env_ids], dim=1)
+        # 2. 本回合最大位移（用于升级能力判定）
+        max_distance = self.episode_max_distance[env_ids]
+
+        if len(final_distance) > 0:
+            if not hasattr(self, "extras"):
+                self.extras = {}
+            # 兼容原有看板：distance 指标改为“本回合最远距离”
+            self.extras["Metrics/mean_distance"] = torch.mean(max_distance).item()
+            self.extras["Metrics/max_distance"] = torch.max(max_distance).item()
+            # 附加终点位移，便于对比“能力”与“收官稳定”
+            self.extras["Metrics/mean_distance_final"] = torch.mean(final_distance).item()
+            self.extras["Metrics/max_distance_final"] = torch.max(final_distance).item()
+        # 3. 升级逻辑：支持按任务配置覆盖升级距离阈值
+        move_up_distance = getattr(self.cfg.terrain, "curriculum_move_up_distance",
+                                   self.cfg.terrain.terrain_length / 2.0)
+        # 升级看“本回合最远到达能力”
+        move_up = max_distance > move_up_distance
+
+        # ==========================================================
+        # [新增日志]：打印触发升级的机器人的地形原点和升级位置
+        # ==========================================================
+        if move_up.any():
+            # 获取真正触发升级的环境ID (利用 move_up 作为掩码)
+            upgraded_env_ids = env_ids[move_up]
+            
+            # 提取对应的 地形原点 和 当前根节点坐标 (转移到CPU方便打印)
+            up_origins = self.env_origins[upgraded_env_ids].cpu().numpy()
+            up_current_pos = self.root_states[upgraded_env_ids, :3].cpu().numpy()
+            
+            print(f"\n[Terrain Curriculum] 触发地形升级! (共 {len(upgraded_env_ids)} 个机器人)")
+            # 遍历打印每个升级机器人的详细坐标 (保留两位小数)
+            for i in range(len(upgraded_env_ids)):
+                e_id = upgraded_env_ids[i].item()
+                origin = up_origins[i]
+                curr_pos = up_current_pos[i]
+                max_dist = max_distance[move_up][i].item()
+                print(f"  -> 环境ID: {e_id:04d} | max_distance: {max_dist:5.2f} | 地形原点: [{origin[0]:6.2f}, {origin[1]:6.2f}, {origin[2]:6.2f}] | 升级触发位置: [{curr_pos[0]:6.2f}, {curr_pos[1]:6.2f}, {curr_pos[2]:6.2f}]")
+            print("-" * 60)
+        # ==========================================================
+        # 4. 降级逻辑：
+        # 降级仍看终点状态，保证“稳定性”要求
+        move_down = (final_distance < 1.0) & (self.episode_length_buf[env_ids] < 300) & (~move_up)
+
+        # [核心优化]：只有在 Level 1 及以上的机器人，才允许真正触发降级！
+        # 防止 Level 0 的机器人在新手村无限触发无效降级并疯狂刷屏。
+        is_not_level_zero = self.terrain_levels[env_ids] > 0
+        valid_move_down = move_down & is_not_level_zero
+
+        # [连续降级保护]：必须连续2次才真正降级，防止随机扰动导致误降
+        # 注意：valid_move_down 是对 env_ids 的掩码，需要用 env_ids[valid_move_down] 来索引
+        downgrade_env_ids = env_ids[valid_move_down]
+        self.consecutive_downgrade_count[downgrade_env_ids] += 1
+        reset_env_ids = env_ids[~valid_move_down]
+        self.consecutive_downgrade_count[reset_env_ids] = 0  # 重置计数
+
+        # 只有连续2次才触发真正降级
+        # 注意：需要用env_ids索引consecutive_downgrade_count，获取当前batch的计数
+        count_in_batch = self.consecutive_downgrade_count[env_ids]
+        real_downgrade = valid_move_down & (count_in_batch >= 2)
+
+        if real_downgrade.any():
+            # 使用过滤后的掩码 real_downgrade
+            downgraded_env_ids = env_ids[real_downgrade]
+
+            down_origins = self.env_origins[downgraded_env_ids].cpu().numpy()
+            down_current_pos = self.root_states[downgraded_env_ids, :3].cpu().numpy()
+
+            print(f"\n[Terrain Curriculum] 触发地形真·降级! (共 {len(downgraded_env_ids)} 个机器人被打回低难度)")
+            for i in range(len(downgraded_env_ids)):
+                e_id = downgraded_env_ids[i].item()
+                origin = down_origins[i]
+                curr_pos = down_current_pos[i]
+                cnt = self.consecutive_downgrade_count[downgraded_env_ids[i]].item()
+                print(f"  -> 环境ID: {e_id:04d} | 连续降级次数: {cnt} | 地形原点: [{origin[0]:6.2f}, {origin[1]:6.2f}, {origin[2]:6.2f}] | 降级触发位置: [{curr_pos[0]:6.2f}, {curr_pos[1]:6.2f}, {curr_pos[2]:6.2f}]")
+            print("-" * 60)
+
+        # 5. 更新等级并限制范围 [0, 9] (注意这里减去的是 real_downgrade)
+        self.terrain_levels[env_ids] += 1 * move_up - 1 * real_downgrade
+        self.terrain_levels[env_ids] = torch.clip(self.terrain_levels[env_ids], 0, self.cfg.terrain.num_rows - 1)
+        
+        # 6. 更新下一次重置的“环境原点”（分配房间）
+        self.env_origins[env_ids] = self.terrain_origins[self.terrain_levels[env_ids], self.terrain_types[env_ids]]
     def update_command_curriculum(self, env_ids):
         """ Implements a curriculum of increasing commands
 
@@ -481,6 +588,18 @@ class LeggedRobot(BaseTask):
                 if self.cfg.control.control_type in ["P", "V"]:
                     print(f"PD gain of joint {name} were not defined, setting them to zero")
         self.default_dof_pos = self.default_dof_pos.unsqueeze(0)
+        # [新增] 记录每个环境所在的行（等级）
+        self.terrain_levels = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        # [新增] 记录每个环境所在的列（类型：0为平缓，1为粗糙，2为上楼，3为下楼...）
+        # 将环境均匀分配到 20 个地形类型中
+        num_cols = self.cfg.terrain.num_cols
+        self.terrain_types = torch.div(torch.arange(self.num_envs, device=self.device),
+                                       (self.num_envs / num_cols), rounding_mode='floor').to(torch.long)
+        # [新增] 记录连续降级次数，只有连续2次才真正降级
+        self.consecutive_downgrade_count = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        # [新增] 回合起点与本回合最远位移（用于折中课程：升级看能力，降级看稳定）
+        self.episode_start_xy = self.root_states[:, :2].clone()
+        self.episode_max_distance = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
 
     def _prepare_reward_function(self):
         """ Prepares a list of reward functions, whcih will be called to compute the total reward.
@@ -635,16 +754,39 @@ class LeggedRobot(BaseTask):
 
     #------------ reward functions----------------
     def _reward_lin_vel_z(self):
-        # Penalize z axis base linear velocity
-        return torch.square(self.base_lin_vel[:, 2])
+        """
+        [死区容忍版] 允许正常的上楼/下楼速度，只严惩剧烈的弹跳和失控坠落。
+        """
+        # 1. 取垂直速度的绝对值
+        vel_z_abs = torch.abs(self.base_lin_vel[:, 2])
+        
+        # 2. 设定 0.2 m/s 的合法死区 (允许机器人正常上下 0.1~0.2m 的台阶)
+        # 只有当速度超出 0.2 m/s 时，才开始计算误差
+        excess_vel = torch.clamp(vel_z_abs - 0.1, min=0.0)
+        
+        # 3. 转化为 0~1 的惩罚项 (超出越多，越接近 1.0)
+        sigma = 0.1 
+        return 1.0 - torch.exp(-torch.square(excess_vel) / sigma)
     
     def _reward_ang_vel_xy(self):
         # Penalize xy axes base angular velocity
         return torch.sum(torch.square(self.base_ang_vel[:, :2]), dim=1)
     
+    # def _reward_orientation(self):
+    #     # Penalize non flat base orientation
+    #     return torch.sum(torch.square(self.projected_gravity[:, :2]), dim=1)
+
     def _reward_orientation(self):
-        # Penalize non flat base orientation
-        return torch.sum(torch.square(self.projected_gravity[:, :2]), dim=1)
+        """
+        [姿态解耦版] 宽容前倾(Pitch)，严惩侧翻(Roll)
+        """
+        # 0 代表 Pitch，乘以一个小系数(如 0.1)，允许爬楼时适当弯腰/前倾
+        pitch_error = torch.square(self.projected_gravity[:, 0]) * 0.5
+        
+        # 1 代表 Roll，乘以一个大系数(如 2.0)，严厉禁止左右侧歪
+        roll_error = torch.square(self.projected_gravity[:, 1]) * 1.5
+        
+        return pitch_error + roll_error
 
     def _reward_base_height(self):
         # Penalize base height away from target
@@ -700,18 +842,98 @@ class LeggedRobot(BaseTask):
         ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
         return torch.exp(-ang_vel_error/self.cfg.rewards.tracking_sigma)
 
+    # def _reward_tracking_ang_vel(self):
+    #     """
+    #     [核心修复 1]：免除视觉对齐时的转弯追踪惩罚
+    #     """
+    #     # 1. 正常计算角速度误差
+    #     ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
+
+    #     # 2. 判断是否在楼梯地形上（用高度极差判断）
+    #     if self.cfg.terrain.mesh_type == 'trimesh' and hasattr(self, 'measured_heights'):
+    #         h_max = torch.max(self.measured_heights, dim=1)[0]
+    #         h_min = torch.min(self.measured_heights, dim=1)[0]
+    #         on_stairs = (h_max - h_min > 0.04)
+
+    #         # 👑 魔法豁免权：在台阶上 且 宏观指令要求直走 (|cmd| < 0.01) 时，
+    #         # 说明任何发生的转弯都是视觉系统在”救命”。强行将误差清零！
+    #         ang_vel_error = torch.where(on_stairs & (torch.abs(self.commands[:, 2]) < 0.01),
+    #                                     torch.zeros_like(ang_vel_error),
+    #                                     ang_vel_error)
+
+    #     return torch.exp(-ang_vel_error / self.cfg.rewards.tracking_sigma)
+
+    # def _reward_tracking_lin_vel(self):
+    #     """ [带门控的速度奖励]：只有方向走对了，给速度才给分 """
+    #     # 1. 计算前向速度得分
+    #     lin_vel_error = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1)
+    #     vel_reward = torch.exp(-lin_vel_error/self.cfg.rewards.tracking_sigma)
+        
+    #     # 2. 计算方向盘得分
+    #     ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
+    #     ang_reward = torch.exp(-ang_vel_error/self.cfg.rewards.tracking_sigma)
+        
+    #     # 3. 乘法门控：转弯逃跑时，这里直接拿 0 分
+    #     return vel_reward * ang_reward
+    
+    # def _reward_tracking_ang_vel(self):
+    #     """ [独立的转向兜底]：保证机器人原地转弯时也有收益 """
+    #     ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
+    #     return torch.exp(-ang_vel_error/self.cfg.rewards.tracking_sigma)
+
     def _reward_feet_air_time(self):
-        # Reward long steps
-        # Need to filter the contacts because the contact reporting of PhysX is unreliable on meshes
-        contact = self.contact_forces[:, self.feet_indices, 2] > 1.
+        """
+        [终极分段引导版] 阶梯诱导 + 突变跃升 + 目标逼近
+        1. 未达阈值时，给予微小线性奖励（搭小梯子，保留梯度）。
+        2. 跨越阈值瞬间，奖励突变放大（给大甜头）。
+        3. 跨越阈值后，越接近 target_air_time (0.35s)，奖励越平滑逼近 1.0。
+        """
+        contact = self.contact_forces[:, self.feet_indices, 2] > 1.0
         contact_filt = torch.logical_or(contact, self.last_contacts) 
         self.last_contacts = contact
-        first_contact = (self.feet_air_time > 0.) * contact_filt
+        
+        # 仅在触地那一瞬间计算奖励
+        first_contact = (self.feet_air_time > 0.0) * contact_filt
         self.feet_air_time += self.dt
-        rew_airTime = torch.sum((self.feet_air_time - 0.5) * first_contact, dim=1) # reward only on first contact with the ground
-        rew_airTime *= torch.norm(self.commands[:, :2], dim=1) > 0.1 #no reward for zero command
+        
+        # --- 1. 计算高斯平滑基础奖励 (终极目标 0.35s) ---
+        target_air_time = 0.35
+        sigma = 0.1 
+        air_time_error = torch.square(self.feet_air_time - target_air_time)
+        # 此时 rew_base 是一个以 0.35 为中心，最高为 1.0 的平滑曲线
+        rew_base = torch.exp(-air_time_error / sigma) 
+        
+        # --- 2. 获取动态课程门槛 ---
+        progress = getattr(self, 'current_terrain_progress', 0.0)
+        if isinstance(progress, torch.Tensor):
+            progress = progress.unsqueeze(1)
+            
+        dynamic_threshold = 0.15 + 0.10 * progress
+        
+        # --- 3. 👑 核心：分段突变逻辑 ---
+        # 【小梯子】：低于阈值时，最多只给 20% 的权重，保留微小梯度让它知道要继续抬
+        gradient_scale = 0.2 * (self.feet_air_time / dynamic_threshold)
+        
+        # 判断是否跨越及格线
+        is_above_threshold = self.feet_air_time > dynamic_threshold
+        
+        # 跨越及格线后，不再压制，权重直接解放为 1.0！
+        # 但此时它的实际得分仍由 rew_base 决定，只有逼近 0.35s 才能拿满。
+        final_scale = torch.where(is_above_threshold, torch.tensor(1.0, device=self.device), gradient_scale)
+        
+        # 融合得出最终的单次滞空得分
+        rew_airTime = rew_base * final_scale
+
+        # --- 4. 结算与重置 ---
+        res = torch.sum(rew_airTime * first_contact, dim=1)
+        
+        # 只有在有前向/侧向速度指令时，才给滞空奖励，防止原地踏步刷分
+        res *= torch.norm(self.commands[:, :2], dim=1) > 0.1 
+        
+        # 重置刚刚触地的那只脚的计时器
         self.feet_air_time *= ~contact_filt
-        return rew_airTime
+        
+        return res
     
     def _reward_stumble(self):
         # Penalize feet hitting vertical surfaces
@@ -719,9 +941,16 @@ class LeggedRobot(BaseTask):
              5 *torch.abs(self.contact_forces[:, self.feet_indices, 2]), dim=1)
         
     def _reward_stand_still(self):
-        # Penalize motion at zero commands
-        return torch.sum(torch.abs(self.dof_pos - self.default_dof_pos), dim=1) * (torch.norm(self.commands[:, :2], dim=1) < 0.1)
-
+        # 1. 没指令乱动的惩罚
+        no_cmd_motion = torch.sum(torch.abs(self.dof_pos - self.default_dof_pos), dim=1) * (torch.norm(self.commands[:, :2], dim=1) < 0.1)
+        
+        # 2. 有指令但不往前的惩罚 (怠工惩罚)
+        # 只要你要求前进速度 > 0.5，但它的实际世界速度 < 0.1，就狠狠扣分！
+        has_cmd = (self.commands[:, 0] > 0.5)
+        not_moving = (torch.norm(self.base_lin_vel[:, :2], dim=1) < 0.1)
+        laziness = (has_cmd & not_moving).float() * 1.0  # 怠工常数惩罚
+        
+        return no_cmd_motion + laziness
     def _reward_feet_contact_forces(self):
         # penalize high contact forces
         return torch.sum((torch.norm(self.contact_forces[:, self.feet_indices, :], dim=-1) -  self.cfg.rewards.max_contact_force).clip(min=0.), dim=1)
