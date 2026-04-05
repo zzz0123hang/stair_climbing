@@ -1,0 +1,30 @@
+{
+    "os": "Linux-6.8.0-101-generic-x86_64-with-glibc2.17",
+    "python": "3.8.20",
+    "heartbeatAt": "2026-03-16T06:34:36.249444",
+    "startedAt": "2026-03-16T06:34:33.994932",
+    "docker": null,
+    "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+    "gpu_count": 1,
+    "cpu_count": 32,
+    "cuda": null,
+    "args": [
+        "--task=g1",
+        "--num_envs",
+        "1",
+        "--load_run",
+        "/home/zzz/unitree_rl_gym/logs/g1/Mar13_23-24-47_TS_S_Climbing"
+    ],
+    "state": "running",
+    "program": "legged_gym/scripts/play.py",
+    "codePath": "legged_gym/scripts/play.py",
+    "git": {
+        "remote": "https://github.com/zzz0123hang/stair_climbing.git",
+        "commit": "750e0f242b127840368610249ad8d8f225e50624"
+    },
+    "email": "13548767672@163.com",
+    "root": "/home/zzz/unitree_rl_gym",
+    "host": "ZZZ",
+    "username": "zzz",
+    "executable": "/home/zzz/anaconda3/envs/unitree_g1/bin/python3"
+}
