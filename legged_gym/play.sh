@@ -1,1 +1,1 @@
-python3 legged_gym/scripts/play.py --task=g1 --num_envs 1 --load_run /home/zzz/unitree_rl_gym/logs/g1/Mar31_23-32-04_TS_S_Climbing
+python3 legged_gym/scripts/play.py --task=g1 --num_envs 1 --load_run /home/zzz/unitree_rl_gym/logs/g1/Apr08_16-05-20_TS_S_Climbing

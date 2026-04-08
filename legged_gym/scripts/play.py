@@ -16,27 +16,36 @@ current_lin_vel_y = 0.0 # 左右
 current_ang_vel_yaw = 0.0 # 转向
 lock = threading.Lock()
 
+def _get_key_char(key):
+    try:
+        if hasattr(key, 'char') and key.char is not None:
+            return key.char.lower()
+    except Exception:
+        pass
+    return None
+
 def on_press(key):
     """键盘按下事件回调函数"""
     global current_lin_vel_x, current_lin_vel_y, current_ang_vel_yaw
     try:
         with lock:
+            key_char = _get_key_char(key)
             # W/S: 前后移动
-            if key.char == 'w':
+            if key_char == 'w' or key == keyboard.Key.up:
                 current_lin_vel_x = 0.8
-            elif key.char == 's':
+            elif key_char == 's' or key == keyboard.Key.down:
                 current_lin_vel_x = -0.5
             
             # A/D: 左右平移 (Side Step)
-            elif key.char == 'a':
+            elif key_char == 'a' or key == keyboard.Key.left:
                 current_lin_vel_y = 0.5
-            elif key.char == 'd':
+            elif key_char == 'd' or key == keyboard.Key.right:
                 current_lin_vel_y = -0.5
             
             # Q/E: 左右旋转 (Turning) - G1需要这个！
-            elif key.char == 'q':
+            elif key_char == 'q':
                 current_ang_vel_yaw = 0.5
-            elif key.char == 'e':
+            elif key_char == 'e':
                 current_ang_vel_yaw = -0.5
                 
     except AttributeError:
@@ -47,11 +56,12 @@ def on_release(key):
     global current_lin_vel_x, current_lin_vel_y, current_ang_vel_yaw
     try:
         with lock:
-            if key.char in ('w', 's'):
+            key_char = _get_key_char(key)
+            if key_char in ('w', 's') or key in (keyboard.Key.up, keyboard.Key.down):
                 current_lin_vel_x = 0.0
-            elif key.char in ('a', 'd'):
+            elif key_char in ('a', 'd') or key in (keyboard.Key.left, keyboard.Key.right):
                 current_lin_vel_y = 0.0
-            elif key.char in ('q', 'e'):
+            elif key_char in ('q', 'e'):
                 current_ang_vel_yaw = 0.0
     except AttributeError:
         pass
@@ -71,6 +81,8 @@ def play(args):
     env_cfg.domain_rand.push_robots = False
     env_cfg.commands.heading_command = False
     env_cfg.commands.resampling_time = 1e9
+    # 保持与训练分布一致：允许视觉回调参与 yaw 纠偏（仅手动下发线速度）
+    env_cfg.env.manual_cmd_override = False
     
     # 【重要】确保相机开启，否则神经网络输入维度会不匹配
     # 虽然不显示图像，但必须产生数据给 Policy 使用
@@ -109,6 +121,7 @@ def play(args):
     # 计数器，用于控制记录频率（可选）
     step_counter = 0
     record_every_n_steps = 1 # 1表示每一步都记，想要减小数据量可以改大
+    print_every_n_steps = 100
 
     # 主循环
     try:
@@ -122,11 +135,15 @@ def play(args):
                 # 假设 commands 顺序: [lin_vel_x, lin_vel_y, ang_vel_yaw]
                 env.commands[:, 0] = current_lin_vel_x
                 env.commands[:, 1] = current_lin_vel_y
-                # env.commands[:, 2] = current_ang_vel_yaw
-                env.commands[:, 3] = 0.0
+                # 当前为 heading_command=False，必须写到 commands[:, 2]
+                env.commands[:, 2] = current_ang_vel_yaw
+                cmd_x, cmd_y, cmd_yaw = current_lin_vel_x, current_lin_vel_y, current_ang_vel_yaw
             
             # 3. 环境步进
             obs, _, rews, dones, infos = env.step(actions.detach())
+            if step_counter % print_every_n_steps == 0:
+                vel_x = env.base_lin_vel[0, 0].item()
+                print(f"[PLAY CMD] x={cmd_x:.2f}, y={cmd_y:.2f}, yaw={cmd_yaw:.2f} | vel_x={vel_x:.2f}")
             # --- 实时记录逻辑 ---
             # --- 实时记录逻辑 ---
             if step_counter % record_every_n_steps == 0:
@@ -143,21 +160,12 @@ def play(args):
                 for name in env.reward_names:
                     key = f'rew_{name}'
                     if key not in data_log: data_log[key] = []
-                    
-                    if hasattr(env, 'reward_functions'):
-                        # 获取奖励函数
-                        rew_func = getattr(env, f'_reward_{name}')
-                        res = rew_func() # 先执行函数
-                        
-                        # 关键修复：判断 res 是否为 Tensor
-                        if torch.is_tensor(res):
-                            val = res.detach()[robot_index].cpu().item()
-                        else:
-                            # 如果已经是 float，直接取值
-                            val = res
-                            
-                        scale = env.reward_scales.get(name, 1.0)
-                        data_log[key].append(val * scale)
+                    # 直接读取环境在本步已计算好的分项奖励，避免二次调用有状态奖励函数污染结果
+                    if hasattr(env, 'step_reward_terms') and name in env.step_reward_terms:
+                        val = env.step_reward_terms[name][robot_index].detach().cpu().item()
+                    else:
+                        val = np.nan
+                    data_log[key].append(val)
 
             # 相机跟随逻辑
             if True:

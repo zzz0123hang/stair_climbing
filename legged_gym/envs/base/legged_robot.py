@@ -185,8 +185,13 @@ class LeggedRobot(BaseTask):
         for i in range(len(self.reward_functions)):
             name = self.reward_names[i]
             rew = self.reward_functions[i]() * self.reward_scales[name]
+            # 兜底：防止奖励函数返回 python 标量导致后续 detach 失败
+            if not torch.is_tensor(rew):
+                rew = torch.full((self.num_envs,), float(rew), dtype=torch.float, device=self.device)
             self.rew_buf += rew
             self.episode_sums[name] += rew
+            if hasattr(self, "step_reward_terms"):
+                self.step_reward_terms[name] = rew.detach()
         if self.cfg.rewards.only_positive_rewards:
             self.rew_buf[:] = torch.clip(self.rew_buf[:], min=0.)
         # add termination reward after clipping
@@ -194,6 +199,8 @@ class LeggedRobot(BaseTask):
             rew = self._reward_termination() * self.reward_scales["termination"]
             self.rew_buf += rew
             self.episode_sums["termination"] += rew
+            if hasattr(self, "step_reward_terms"):
+                self.step_reward_terms["termination"] = rew.detach()
     
     def compute_observations(self):
         """ Computes observations
@@ -389,8 +396,42 @@ class LeggedRobot(BaseTask):
         push_env_ids = env_ids[self.episode_length_buf[env_ids] % int(self.cfg.domain_rand.push_interval) == 0]
         if len(push_env_ids) == 0:
             return
-        max_vel = self.cfg.domain_rand.max_push_vel_xy
-        self.root_states[:, 7:9] = torch_rand_float(-max_vel, max_vel, (self.num_envs, 2), device=self.device) # lin vel x/y
+        max_vel = float(self.cfg.domain_rand.max_push_vel_xy)
+
+        # 可选：推搡课程化。前期弱/关推搡，后期再逐步拉起，减少对主任务学习的污染。
+        if bool(getattr(self.cfg.domain_rand, "push_curriculum", False)):
+            push_start_progress = float(getattr(self.cfg.domain_rand, "push_start_progress", 0.45))
+            push_min_scale = float(getattr(self.cfg.domain_rand, "push_min_scale", 0.0))
+            den = max(1.0 - push_start_progress, 1e-6)
+            if hasattr(self, "current_terrain_progress"):
+                prog_all = self.current_terrain_progress
+                if not torch.is_tensor(prog_all):
+                    prog_all = torch.full((self.num_envs,), float(prog_all), device=self.device)
+                elif prog_all.ndim == 0:
+                    prog_all = prog_all.repeat(self.num_envs)
+                else:
+                    prog_all = prog_all.to(self.device)
+                prog = prog_all[push_env_ids]
+            else:
+                prog = torch.zeros(len(push_env_ids), device=self.device)
+
+            push_scale = torch.clamp((prog - push_start_progress) / den, min=0.0, max=1.0)
+            push_scale = torch.clamp(push_min_scale + (1.0 - push_min_scale) * push_scale,
+                                     min=push_min_scale, max=1.0)
+            max_vel_env = max_vel * push_scale
+            active = max_vel_env > 1e-4
+            if not active.any():
+                return
+            push_env_ids = push_env_ids[active]
+            max_vel_env = max_vel_env[active]
+            rand_xy = 2.0 * torch.rand((len(push_env_ids), 2), device=self.device) - 1.0
+            # 仅对被选中的环境施加推搡，避免污染其余环境的状态缓存
+            self.root_states[push_env_ids, 7:9] = rand_xy * max_vel_env.unsqueeze(1)
+        else:
+            # 仅对被选中的环境施加推搡，避免污染其余环境的状态缓存
+            self.root_states[push_env_ids, 7:9] = torch_rand_float(
+                -max_vel, max_vel, (len(push_env_ids), 2), device=self.device
+            ) # lin vel x/y
         
         env_ids_int32 = push_env_ids.to(dtype=torch.int32)
         self.gym.set_actor_root_state_tensor_indexed(self.sim,
@@ -423,13 +464,62 @@ class LeggedRobot(BaseTask):
         # 3. 升级逻辑：支持按任务配置覆盖升级距离阈值
         move_up_distance = getattr(self.cfg.terrain, "curriculum_move_up_distance",
                                    self.cfg.terrain.terrain_length / 2.0)
-        # 升级看“本回合最远到达能力”
-        move_up = max_distance > move_up_distance
+        # 抗推搡污染：升级不仅看 max_distance，还要求回合末仍保持足够位移
+        # 防止“被外力推远一瞬间”误判为可升级能力。
+        move_up_final_ratio = float(getattr(self.cfg.terrain, "curriculum_move_up_final_ratio", 0.45))
+        dist_gate = max_distance > move_up_distance
+        final_gate = final_distance > move_up_distance * move_up_final_ratio
+        move_up = dist_gate & final_gate
+        # 任务相关升级门槛：需要有足够楼梯暴露占比，避免“平地跑很远也升级”
+        move_up_stair_conf = float(getattr(self.cfg.terrain, "curriculum_move_up_stair_conf", 0.0))
+        stair_gate = torch.ones_like(move_up, dtype=torch.bool)
+        nav_gate = torch.ones_like(move_up, dtype=torch.bool)
+        if move_up_stair_conf > 0.0 and hasattr(self, "episode_stair_conf_sum"):
+            if hasattr(self, "episode_nav_steps"):
+                nav_steps_raw = self.episode_nav_steps[env_ids].float()
+            else:
+                nav_steps_raw = self.episode_length_buf[env_ids].float()
+            nav_steps = torch.clamp(nav_steps_raw, min=1.0)
+            mean_stair_conf = self.episode_stair_conf_sum[env_ids] / nav_steps
+            peak_thr = float(getattr(self.cfg.terrain, "curriculum_move_up_stair_conf_peak",
+                                     move_up_stair_conf + 0.20))
+            nav_steps_min = float(getattr(self.cfg.terrain, "curriculum_move_up_nav_steps_min", 20.0))
+            peak_stair_conf = self.episode_stair_conf_max[env_ids] if hasattr(self, "episode_stair_conf_max") \
+                else mean_stair_conf
+            stair_ok = (mean_stair_conf > move_up_stair_conf) | (peak_stair_conf > peak_thr)
+            nav_ok = nav_steps_raw >= nav_steps_min
+            stair_gate = stair_ok
+            nav_gate = nav_ok
+            move_up = move_up & stair_gate & nav_gate
+
+        if len(env_ids) > 0:
+            if not hasattr(self, "extras"):
+                self.extras = {}
+            # 升级诊断指标：显式拆分每个 gate，避免把 stair_gate 误读为最终升级条件
+            stair_nav_gate = stair_gate & nav_gate
+            joint_gate = dist_gate & stair_gate & nav_gate
+            self.extras["Metrics/move_up_dist_gate_rate"] = torch.mean(dist_gate.float()).item()
+            self.extras["Metrics/move_up_stair_gate_rate"] = torch.mean(stair_gate.float()).item()
+            self.extras["Metrics/move_up_nav_gate_rate"] = torch.mean(nav_gate.float()).item()
+            self.extras["Metrics/move_up_stair_nav_gate_rate"] = torch.mean(stair_nav_gate.float()).item()
+            self.extras["Metrics/move_up_joint_gate_rate"] = torch.mean(joint_gate.float()).item()
+            self.extras["Metrics/move_up_ready_rate"] = torch.mean(move_up.float()).item()
+
+            # 平地转圈倾向诊断：横摆/偏航相对前向推进的比值
+            if hasattr(self, "episode_abs_vx_sum") and hasattr(self, "episode_abs_vy_sum") and \
+               hasattr(self, "episode_abs_wz_sum") and hasattr(self, "episode_nav_steps"):
+                nav_steps_diag = torch.clamp(self.episode_nav_steps[env_ids].float(), min=1.0)
+                mean_abs_vx = self.episode_abs_vx_sum[env_ids] / nav_steps_diag
+                mean_abs_vy = self.episode_abs_vy_sum[env_ids] / nav_steps_diag
+                mean_abs_wz = self.episode_abs_wz_sum[env_ids] / nav_steps_diag
+                circle_index = (mean_abs_vy + 0.35 * mean_abs_wz) / (mean_abs_vx + 0.05)
+                self.extras["Metrics/mean_circle_index_episode"] = torch.mean(circle_index).item()
 
         # ==========================================================
         # [新增日志]：打印触发升级的机器人的地形原点和升级位置
         # ==========================================================
-        if move_up.any():
+        curriculum_verbose = bool(getattr(self.cfg.env, "log_curriculum_events", False))
+        if curriculum_verbose and move_up.any():
             # 获取真正触发升级的环境ID (利用 move_up 作为掩码)
             upgraded_env_ids = env_ids[move_up]
             
@@ -448,8 +538,13 @@ class LeggedRobot(BaseTask):
             print("-" * 60)
         # ==========================================================
         # 4. 降级逻辑：
-        # 降级仍看终点状态，保证“稳定性”要求
-        move_down = (final_distance < 1.0) & (self.episode_length_buf[env_ids] < 300) & (~move_up)
+        # 去掉“仅短回合可降级”的硬条件，避免长回合几乎无法降级。
+        # 同时加入 max_distance 约束，避免“过程有推进、终点回摆”被误降。
+        move_down_distance = float(getattr(self.cfg.terrain, "curriculum_move_down_distance", 1.0))
+        move_down_max_ratio = float(getattr(self.cfg.terrain, "curriculum_move_down_max_ratio", 0.55))
+        move_down = (final_distance < move_down_distance) & \
+                    (max_distance < move_up_distance * move_down_max_ratio) & \
+                    (~move_up)
 
         # [核心优化]：只有在 Level 1 及以上的机器人，才允许真正触发降级！
         # 防止 Level 0 的机器人在新手村无限触发无效降级并疯狂刷屏。
@@ -468,7 +563,7 @@ class LeggedRobot(BaseTask):
         count_in_batch = self.consecutive_downgrade_count[env_ids]
         real_downgrade = valid_move_down & (count_in_batch >= 2)
 
-        if real_downgrade.any():
+        if curriculum_verbose and real_downgrade.any():
             # 使用过滤后的掩码 real_downgrade
             downgraded_env_ids = env_ids[real_downgrade]
 
@@ -625,6 +720,9 @@ class LeggedRobot(BaseTask):
         # reward episode sums
         self.episode_sums = {name: torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
                              for name in self.reward_scales.keys()}
+        # 每步分项奖励（用于 play/debug，避免二次调用有状态奖励函数）
+        self.step_reward_terms = {name: torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+                                  for name in self.reward_scales.keys()}
 
     def _create_ground_plane(self):
         """ Adds a ground plane to the simulation, sets friction and restitution based on the cfg.

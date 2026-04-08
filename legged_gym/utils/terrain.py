@@ -34,13 +34,87 @@ class Terrain:
             self.selected_terrain()
         else:    
             self.randomized_terrain()   
-        
+
+        self._build_stair_edge_lookup_maps()
         self.heightsamples = self.height_field_raw
         if self.type=="trimesh":
             self.vertices, self.triangles = terrain_utils.convert_heightfield_to_trimesh(   self.height_field_raw,
                                                                                             self.cfg.horizontal_scale,
                                                                                             self.cfg.vertical_scale,
                                                                                             self.cfg.slope_treshold)
+
+    @staticmethod
+    def _scan_prev_inclusive(edge_mask: np.ndarray, axis: int) -> np.ndarray:
+        edge = np.moveaxis(edge_mask, axis, 0)
+        length = edge.shape[0]
+        out = np.full(edge.shape, -1, dtype=np.int32)
+        last = np.full(edge.shape[1], -1, dtype=np.int32)
+        for i in range(length):
+            last = np.where(edge[i], i, last)
+            out[i] = last
+        return np.moveaxis(out, 0, axis)
+
+    @staticmethod
+    def _scan_next_strict(edge_mask: np.ndarray, axis: int) -> np.ndarray:
+        edge = np.moveaxis(edge_mask, axis, 0)
+        length = edge.shape[0]
+        out = np.full(edge.shape, -1, dtype=np.int32)
+        nxt = np.full(edge.shape[1], -1, dtype=np.int32)
+        for i in range(length - 1, -1, -1):
+            out[i] = nxt
+            nxt = np.where(edge[i], i, nxt)
+        return np.moveaxis(out, 0, axis)
+
+    def _build_stair_edge_lookup_maps(self):
+        """
+        预计算“最近台阶边缘索引”查表：
+        - x/y 轴
+        - 前向符号 + / -
+        - back / front 最近边缘
+        边缘索引定义在栅格坐标系，运行时可 O(1) 查表换算到世界坐标。
+        """
+        h = self.height_field_raw.astype(np.int32, copy=False)
+        vertical_scale = max(float(self.cfg.vertical_scale), 1e-6)
+        edge_h_thr = float(getattr(self.cfg, "edge_height_threshold", 0.03))
+        raw_thr = max(1, int(np.ceil(edge_h_thr / vertical_scale)))
+
+        dx = h[1:, :] - h[:-1, :]   # 边界索引 i: 在 x=i 处跨越 (i-1 -> i)
+        dy = h[:, 1:] - h[:, :-1]   # 边界索引 j: 在 y=j 处跨越 (j-1 -> j)
+
+        edge_x_pos = np.zeros_like(h, dtype=bool)
+        edge_x_neg = np.zeros_like(h, dtype=bool)
+        edge_y_pos = np.zeros_like(h, dtype=bool)
+        edge_y_neg = np.zeros_like(h, dtype=bool)
+
+        edge_x_pos[1:, :] = dx >= raw_thr
+        edge_x_neg[1:, :] = (-dx) >= raw_thr
+        edge_y_pos[:, 1:] = dy >= raw_thr
+        edge_y_neg[:, 1:] = (-dy) >= raw_thr
+
+        back_x_pos = self._scan_prev_inclusive(edge_x_pos, axis=0)
+        front_x_pos = self._scan_next_strict(edge_x_pos, axis=0)
+        back_x_neg = self._scan_next_strict(edge_x_neg, axis=0)
+        front_x_neg = self._scan_prev_inclusive(edge_x_neg, axis=0)
+
+        back_y_pos = self._scan_prev_inclusive(edge_y_pos, axis=1)
+        front_y_pos = self._scan_next_strict(edge_y_pos, axis=1)
+        back_y_neg = self._scan_next_strict(edge_y_neg, axis=1)
+        front_y_neg = self._scan_prev_inclusive(edge_y_neg, axis=1)
+
+        max_dim = max(h.shape[0], h.shape[1])
+        index_dtype = np.int16 if max_dim < np.iinfo(np.int16).max else np.int32
+        self.stair_edge_lookup = {
+            "back_x_pos": back_x_pos.astype(index_dtype, copy=False),
+            "front_x_pos": front_x_pos.astype(index_dtype, copy=False),
+            "back_x_neg": back_x_neg.astype(index_dtype, copy=False),
+            "front_x_neg": front_x_neg.astype(index_dtype, copy=False),
+            "back_y_pos": back_y_pos.astype(index_dtype, copy=False),
+            "front_y_pos": front_y_pos.astype(index_dtype, copy=False),
+            "back_y_neg": back_y_neg.astype(index_dtype, copy=False),
+            "front_y_neg": front_y_neg.astype(index_dtype, copy=False),
+        }
+        self.stair_edge_raw_threshold = raw_thr
+        self.stair_edge_height_threshold = raw_thr * vertical_scale
     
     def randomized_terrain(self):
         for k in range(self.cfg.num_sub_terrains):

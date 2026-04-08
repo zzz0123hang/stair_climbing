@@ -5,7 +5,8 @@ import torch
 import warp as wp
 import sys
 import os
-os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+# 调试 CUDA 内核错误时可临时设置：CUDA_LAUNCH_BLOCKING=1
+# os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 from sensors.warp.warp_stereo_cam import WarpStereoCam
 from legged_gym.utils.terrain import Terrain  # 导入机器人配置
 import math
@@ -98,6 +99,9 @@ class G1Robot(LeggedRobot):
         self.episode_abs_wz_sum = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
         # 指令模式掩码：True 表示“随机探索样本”（该样本 yaw 不做视觉覆写）
         self.explore_cmd_mask = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        # 交替步态记忆：用于抑制“同一只脚长期领步”的局部最优
+        self.alt_prev_lead_sign = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
+        self.alt_same_lead_steps = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
 
     def _get_explore_task_gate(self, default_weight=0.30):
         """
@@ -365,27 +369,121 @@ class G1Robot(LeggedRobot):
         
         return heights * self.cfg.terrain.vertical_scale
 
+    def _estimate_stairs_raw_confidence(self, env_ids=None):
+        """融合“边缘查表”和 measured_heights ROI 的原始楼梯置信度（未做时间平滑）。"""
+        n = self.num_envs if env_ids is None else len(env_ids)
+        if n == 0:
+            return torch.zeros(0, dtype=torch.float, device=self.device)
+        conf = torch.zeros(n, dtype=torch.float, device=self.device)
+        has_signal = False
+
+        # A) 基于预计算边缘查表的前方边缘密度/跳变置信度
+        if getattr(self, "has_stair_edge_lookup", False) and hasattr(self, "height_samples"):
+            base_states = self.root_states if env_ids is None else self.root_states[env_ids]
+            base_xy = base_states[:, :2]
+            yaw = self.rpy[:, 2] if env_ids is None else self.rpy[env_ids, 2]
+            fwd = torch.stack([torch.cos(yaw), torch.sin(yaw)], dim=1)
+            lat = torch.stack([-fwd[:, 1], fwd[:, 0]], dim=1)
+
+            step = float(self.cfg.terrain.horizontal_scale)
+            border = float(self.cfg.terrain.border_size)
+            vertical_scale = float(self.cfg.terrain.vertical_scale)
+            grid_rows, grid_cols = self.height_samples.shape
+
+            if (not hasattr(self, "stair_conf_forward_probes")) or (self.stair_conf_forward_probes.device != self.device):
+                self.stair_conf_forward_probes = torch.tensor([0.10, 0.20, 0.30, 0.40], device=self.device, dtype=torch.float32)
+                self.stair_conf_lateral_probes = torch.tensor([-0.10, 0.0, 0.10], device=self.device, dtype=torch.float32)
+                local = torch.tensor([-1, 0, 1], device=self.device, dtype=torch.long)
+                gx, gy = torch.meshgrid(local, local, indexing='ij')
+                self.stair_conf_local_dx = gx.reshape(-1)
+                self.stair_conf_local_dy = gy.reshape(-1)
+
+            fw = self.stair_conf_forward_probes
+            lw = self.stair_conf_lateral_probes
+            probe_xy = base_xy.unsqueeze(1).unsqueeze(2) + \
+                fwd.unsqueeze(1).unsqueeze(2) * fw.view(1, -1, 1, 1) + \
+                lat.unsqueeze(1).unsqueeze(2) * lw.view(1, 1, -1, 1)
+            probe_xy = probe_xy.reshape(n, -1, 2)
+
+            use_x_axis = torch.abs(fwd[:, 0]) >= torch.abs(fwd[:, 1])
+            axis_sign = torch.where(use_x_axis, torch.sign(fwd[:, 0]), torch.sign(fwd[:, 1]))
+            axis_sign = torch.where(torch.abs(axis_sign) < 1e-5, torch.ones_like(axis_sign), axis_sign)
+
+            sample_axis = torch.where(use_x_axis.unsqueeze(1), probe_xy[..., 0], probe_xy[..., 1])
+            probe_x_idx = torch.clamp(torch.floor((probe_xy[..., 0] + border) / step), 0, float(grid_rows - 1)).long()
+            probe_y_idx = torch.clamp(torch.floor((probe_xy[..., 1] + border) / step), 0, float(grid_cols - 1)).long()
+
+            front_idx = torch.full((n, probe_xy.shape[1]), -1, device=self.device, dtype=torch.int32)
+            mask_x_pos = use_x_axis & (axis_sign > 0.0)
+            mask_x_neg = use_x_axis & (axis_sign < 0.0)
+            mask_y_pos = (~use_x_axis) & (axis_sign > 0.0)
+            mask_y_neg = (~use_x_axis) & (axis_sign < 0.0)
+
+            if mask_x_pos.any():
+                front_idx[mask_x_pos] = self.stair_edge_front_x_pos[probe_x_idx[mask_x_pos], probe_y_idx[mask_x_pos]]
+            if mask_x_neg.any():
+                front_idx[mask_x_neg] = self.stair_edge_front_x_neg[probe_x_idx[mask_x_neg], probe_y_idx[mask_x_neg]]
+            if mask_y_pos.any():
+                front_idx[mask_y_pos] = self.stair_edge_front_y_pos[probe_x_idx[mask_y_pos], probe_y_idx[mask_y_pos]]
+            if mask_y_neg.any():
+                front_idx[mask_y_neg] = self.stair_edge_front_y_neg[probe_x_idx[mask_y_neg], probe_y_idx[mask_y_neg]]
+
+            front_edge_axis = front_idx.to(torch.float32) * step - border
+            front_dist = axis_sign.unsqueeze(1) * (front_edge_axis - sample_axis)
+            valid_front = (front_idx >= 0) & (front_dist >= 0.0) & (front_dist <= 0.45)
+            near_front = (front_idx >= 0) & (front_dist >= 0.0) & (front_dist <= 0.22)
+            edge_density = valid_front.float().mean(dim=1)
+            near_density = near_front.float().mean(dim=1)
+
+            base_x_idx = torch.clamp(torch.floor((base_xy[:, 0] + border) / step), 0, float(grid_rows - 1)).long()
+            base_y_idx = torch.clamp(torch.floor((base_xy[:, 1] + border) / step), 0, float(grid_cols - 1)).long()
+            px = torch.clamp(base_x_idx.unsqueeze(1) + self.stair_conf_local_dx.view(1, -1), 0, grid_rows - 1)
+            py = torch.clamp(base_y_idx.unsqueeze(1) + self.stair_conf_local_dy.view(1, -1), 0, grid_cols - 1)
+            local_h = self.height_samples[px, py].to(torch.float32) * vertical_scale
+            local_range = local_h.amax(dim=1) - local_h.amin(dim=1)
+
+            front_probe_xy = base_xy + fwd * 0.20
+            front_x_idx = torch.clamp(torch.floor((front_probe_xy[:, 0] + border) / step), 0, float(grid_rows - 1)).long()
+            front_y_idx = torch.clamp(torch.floor((front_probe_xy[:, 1] + border) / step), 0, float(grid_cols - 1)).long()
+            h_base = self.height_samples[base_x_idx, base_y_idx].to(torch.float32) * vertical_scale
+            h_front = self.height_samples[front_x_idx, front_y_idx].to(torch.float32) * vertical_scale
+            front_delta = torch.abs(h_front - h_base)
+
+            density_conf = torch.sigmoid((edge_density - 0.16) / 0.06)
+            near_conf = torch.sigmoid((near_density - 0.10) / 0.05)
+            range_conf = torch.sigmoid((local_range - 0.035) / 0.008)
+            jump_conf = torch.sigmoid((front_delta - 0.012) / 0.004)
+            lookup_conf = torch.maximum(torch.maximum(density_conf, near_conf), torch.maximum(range_conf, jump_conf))
+            conf = torch.maximum(conf, lookup_conf)
+            has_signal = True
+
+        # B) measured_heights ROI 置信度（与旧版兼容，作为补充信号）
+        if hasattr(self, "measured_heights"):
+            h = self.measured_heights if env_ids is None else self.measured_heights[env_ids]
+            nx, ny = self.measured_grid_shape if hasattr(self, "measured_grid_shape") else (17, 11)
+            g = h.view(-1, nx, ny)
+
+            cx, cy = nx // 2, ny // 2
+            local = g[:, max(0, cx - 3):min(nx, cx + 4), max(0, cy - 2):min(ny, cy + 3)]
+            center = g[:, max(0, cx - 1):min(nx, cx + 2), max(0, cy - 1):min(ny, cy + 2)]
+            front = g[:, max(0, cx + 2):min(nx, cx + 6), max(0, cy - 1):min(ny, cy + 2)]
+            local_range = local.amax(dim=(1, 2)) - local.amin(dim=(1, 2))
+            front_delta = torch.abs(front.mean(dim=(1, 2)) - center.mean(dim=(1, 2)))
+            range_conf = torch.sigmoid((local_range - 0.04) / 0.006)
+            front_conf = torch.sigmoid((front_delta - 0.015) / 0.004)
+            roi_conf = torch.maximum(range_conf, front_conf)
+            conf = torch.maximum(conf, roi_conf)
+            has_signal = True
+
+        if not has_signal:
+            return torch.zeros(n, dtype=torch.float, device=self.device)
+        return conf
+
     def _estimate_on_stairs_mask(self, env_ids=None, update_state=True):
-        """局部 ROI + 双阈值滞回的楼梯判定，减少边缘误判和模式抖动。"""
-        if not hasattr(self, "measured_heights"):
-            n = self.num_envs if env_ids is None else len(env_ids)
-            return torch.zeros(n, dtype=torch.bool, device=self.device)
-
-        h = self.measured_heights if env_ids is None else self.measured_heights[env_ids]
-        nx, ny = self.measured_grid_shape if hasattr(self, "measured_grid_shape") else (17, 11)
-        g = h.view(-1, nx, ny)
-
-        cx, cy = nx // 2, ny // 2
-        local = g[:, max(0, cx - 3):min(nx, cx + 4), max(0, cy - 2):min(ny, cy + 3)]
-        center = g[:, max(0, cx - 1):min(nx, cx + 2), max(0, cy - 1):min(ny, cy + 2)]
-        front = g[:, max(0, cx + 2):min(nx, cx + 6), max(0, cy - 1):min(ny, cy + 2)]
-
-        local_range = local.amax(dim=(1, 2)) - local.amin(dim=(1, 2))
-        front_delta = torch.abs(front.mean(dim=(1, 2)) - center.mean(dim=(1, 2)))
-
-        # 双阈值滞回：进入门槛高，退出门槛低，避免切换抖动
-        enter = (local_range > 0.05) | (front_delta > 0.02)
-        exit_ = (local_range < 0.03) & (front_delta < 0.01)
+        """边缘查表+ROI 融合置信度 + 双阈值滞回的楼梯判定。"""
+        raw_conf = self._estimate_stairs_raw_confidence(env_ids)
+        enter = raw_conf > 0.42
+        exit_ = raw_conf < 0.18
 
         if hasattr(self, "on_stairs_state"):
             prev = self.on_stairs_state if env_ids is None else self.on_stairs_state[env_ids]
@@ -403,28 +501,8 @@ class G1Robot(LeggedRobot):
 
     def _estimate_on_stairs_confidence(self, env_ids=None, update_state=True):
         """连续楼梯置信度（0~1），用于软门控，避免状态硬切。"""
-        if not hasattr(self, "measured_heights"):
-            n = self.num_envs if env_ids is None else len(env_ids)
-            return torch.zeros(n, dtype=torch.float, device=self.device)
+        stair_conf = self._estimate_stairs_raw_confidence(env_ids)
 
-        h = self.measured_heights if env_ids is None else self.measured_heights[env_ids]
-        nx, ny = self.measured_grid_shape if hasattr(self, "measured_grid_shape") else (17, 11)
-        g = h.view(-1, nx, ny)
-
-        cx, cy = nx // 2, ny // 2
-        local = g[:, max(0, cx - 3):min(nx, cx + 4), max(0, cy - 2):min(ny, cy + 3)]
-        center = g[:, max(0, cx - 1):min(nx, cx + 2), max(0, cy - 1):min(ny, cy + 2)]
-        front = g[:, max(0, cx + 2):min(nx, cx + 6), max(0, cy - 1):min(ny, cy + 2)]
-
-        local_range = local.amax(dim=(1, 2)) - local.amin(dim=(1, 2))
-        front_delta = torch.abs(front.mean(dim=(1, 2)) - center.mean(dim=(1, 2)))
-
-        # 用 sigmoid 替代硬阈值：在阈值附近保持可学习的平滑过渡
-        range_conf = torch.sigmoid((local_range - 0.04) / 0.006)
-        front_conf = torch.sigmoid((front_delta - 0.015) / 0.004)
-        stair_conf = torch.maximum(range_conf, front_conf)
-
-        # 时间平滑，减少帧间抖动
         beta = 0.2
         if hasattr(self, "on_stairs_conf_state"):
             prev = self.on_stairs_conf_state if env_ids is None else self.on_stairs_conf_state[env_ids]
@@ -552,42 +630,38 @@ class G1Robot(LeggedRobot):
                     val = val.item() if val.numel() == 1 else torch.mean(val).item()
                 self.reward_scales[name] = float(val) * dt
 
-        # 2. 【前半程：导航与跟踪优先】
-        # 降低平地可持续刷分项占比，避免“稳定小步走”压过上楼主目标
-        safe_update("tracking_lin_vel", 1.15 - 0.10 * late_stage_progress, per_env=True)
-        safe_update("tracking_ang_vel", 1.30 + 0.18 * terrain_progress, per_env=True)
-        # 预接近阶段保留牵引，但减少其长期主导性
-        safe_update("approach_stairs", 0.45 + 0.30 * (1.0 - late_stage_progress), per_env=True)
-        # 强化台阶前“第一步承诺”，把策略从台阶口局部最优拉出来
-        safe_update("first_step_commit", 0.55 + 0.30 * (1.0 - late_stage_progress), per_env=True)
-        # contact 小幅增强：用于抑制平地短时失支撑（双脚瞬时离地）
-        safe_update("contact", 0.12 + 0.14 * late_stage_progress, per_env=True)
-        # 强化“无命令要停、有命令别怠工”
-        safe_update("stand_still", -0.18 - 0.16 * late_stage_progress, per_env=True)
- 
-        # 3. 【姿态课程】中后期加强稳定性
+        safe_update("tracking_lin_vel", 1.20 - 0.08 * late_stage_progress, per_env=True)
+        safe_update("stand_still", -0.07 - 0.05 * late_stage_progress, per_env=True)
         self.dynamic_base_height_target = 0.72 + 0.03 * float(global_progress.item())
         safe_update("orientation", -0.25 - 0.45 * late_stage_progress, per_env=True)
-
-        # 4. 【后半程：楼梯安全精修】
-        safe_update("feet_stumble", -0.08 - 0.32 * late_stage_progress, per_env=True)
-        # 安全贴合：后期拉到约 -0.6，并采用缓升避免前期过猛
-        safe_update("foot_support_rect", -0.04 - 0.40 * torch.pow(late_stage_progress, 1.50), per_env=True)
-        # 楼梯抬腿主项抬高：让“真跨阶动作”梯度可见，不再长期贴近 0
-        safe_update("stair_clearance", 0.55 + 0.65 * late_stage_progress, per_env=True)
-        # 交替步态：正权重课程（函数内部直接返回“奖励-惩罚”）
-        # 与旧版负权重 * (惩罚-奖励) 数学等价，但语义更直观、调参更安全
-        # 控制后期上限，避免交替项在难度升级后压过“接近楼梯/持续上楼”收益
-        safe_update("stair_alternation", 0.90 + 1.00 * late_stage_progress, per_env=True)
-        # 视觉对齐强约束：早期给方向，后期避免“看见楼梯仍侧身/绕圈”
+        # safe_update("pelvis_height", 0.08 + 0.12 * late_stage_progress, per_env=True)
+        safe_update("pelvis_height", 0.10 + 0.14 * late_stage_progress, per_env=True)
         safe_update("vision_stair_drive", -0.20 - 0.45 * late_stage_progress, per_env=True)
-
-        # 5. 【运动质量】全程稳态约束，后期略强化
-        # 轻微加严 z 轴速度约束，压制“短促弹跳/跳步”
-        safe_update("lin_vel_z", -0.46 + 0.12 * late_stage_progress, per_env=True)
-        # 后期允许上下跃迁，但横向抖动和高频抖腿应更受控
-        safe_update("action_rate", -0.012 - 0.006 * late_stage_progress, per_env=True)
         safe_update("ang_vel_xy", -0.045 - 0.020 * late_stage_progress, per_env=True)
+        ######
+        safe_update("approach_stairs", 0.40 + 0.24 * (1.0 - late_stage_progress), per_env=True)
+        safe_update("tracking_ang_vel", 1.10 + 0.10 * terrain_progress, per_env=True)
+        safe_update("contact", 0.12 + 0.09 * late_stage_progress, per_env=True)
+        safe_update("first_step_commit", 0.22 + 0.16 * (1.0 - late_stage_progress), per_env=True)
+        safe_update("lin_vel_z", -0.75 + 0.18 * late_stage_progress, per_env=True)
+        safe_update("action_rate", -0.020 - 0.010 * late_stage_progress, per_env=True)
+        # 台阶前“脚尖贴边”专项：中后期显著增强踩边惩罚与防绊倒惩罚
+        safe_update("foot_support_rect", 0.12 + 0.55 * torch.pow(late_stage_progress, 1.35), per_env=True)
+        safe_update("stair_clearance", 0.70 + 0.70 * late_stage_progress, per_env=True)
+        safe_update("feet_stumble", -0.40 - 0.95 * late_stage_progress, per_env=True)
+        safe_update("hip_pos", -0.22 - 0.20 * late_stage_progress, per_env=True)
+        safe_update("stair_alternation", 2.20 + 2.20 * late_stage_progress, per_env=True)
+        ###########
+        # safe_update("approach_stairs", 0.138 + 0.078 * (1.0 - late_stage_progress), per_env=True)
+        # safe_update("tracking_ang_vel", 0.920 + 0.080 * terrain_progress, per_env=True)
+        # safe_update("contact", 0.082 + 0.060 * late_stage_progress, per_env=True)
+        # safe_update("first_step_commit", 0.040 + 0.030 * (1.0 - late_stage_progress), per_env=True)
+        # safe_update("lin_vel_z", -0.900 + 0.216 * late_stage_progress, per_env=True)
+        # safe_update("action_rate", -0.024 - 0.012 * late_stage_progress, per_env=True)
+        # safe_update("foot_support_rect", -0.220 - 1.780 * torch.pow(late_stage_progress, 1.50), per_env=True)
+        # safe_update("stair_clearance", 0.48 + 0.48 * late_stage_progress, per_env=True)
+        # safe_update("feet_stumble", -0.210 - 0.780 * late_stage_progress, per_env=True)
+        # safe_update("stair_alternation", 3.300 + 3.300 * late_stage_progress, per_env=True)
 
         self.current_terrain_progress = terrain_progress
         self.current_late_stage_progress = late_stage_progress
@@ -948,11 +1022,36 @@ class G1Robot(LeggedRobot):
             self.terrain.height_field_raw.copy(),  # 复制原始数据
             dtype=torch.float32
         ).to(self.device) * self.cfg.terrain.vertical_scale  # 乘以垂直缩放系数
+
+        # 预计算台阶边缘查表（由 Terrain 在初始化阶段构建）
+        self.stair_edge_back_x_pos = None
+        self.stair_edge_front_x_pos = None
+        self.stair_edge_back_x_neg = None
+        self.stair_edge_front_x_neg = None
+        self.stair_edge_back_y_pos = None
+        self.stair_edge_front_y_pos = None
+        self.stair_edge_back_y_neg = None
+        self.stair_edge_front_y_neg = None
+        self.stair_edge_h_thr = float(getattr(self.cfg.terrain, "edge_height_threshold", 0.03))
+        self.has_stair_edge_lookup = False
+
+        if hasattr(self.terrain, "stair_edge_lookup"):
+            lookup = self.terrain.stair_edge_lookup
+            self.stair_edge_back_x_pos = torch.tensor(lookup["back_x_pos"], dtype=torch.int32, device=self.device)
+            self.stair_edge_front_x_pos = torch.tensor(lookup["front_x_pos"], dtype=torch.int32, device=self.device)
+            self.stair_edge_back_x_neg = torch.tensor(lookup["back_x_neg"], dtype=torch.int32, device=self.device)
+            self.stair_edge_front_x_neg = torch.tensor(lookup["front_x_neg"], dtype=torch.int32, device=self.device)
+            self.stair_edge_back_y_pos = torch.tensor(lookup["back_y_pos"], dtype=torch.int32, device=self.device)
+            self.stair_edge_front_y_pos = torch.tensor(lookup["front_y_pos"], dtype=torch.int32, device=self.device)
+            self.stair_edge_back_y_neg = torch.tensor(lookup["back_y_neg"], dtype=torch.int32, device=self.device)
+            self.stair_edge_front_y_neg = torch.tensor(lookup["front_y_neg"], dtype=torch.int32, device=self.device)
+            self.stair_edge_h_thr = float(getattr(self.terrain, "stair_edge_height_threshold", self.stair_edge_h_thr))
+            self.has_stair_edge_lookup = True
     
     # 请放在 g1_env.py 的 G1Robot 类中
     def _resample_commands(self, env_ids):
         """
-        [终极修复版] 指令重采样与软牵引课程
+        [终极修复版 + 全向自由探索] 指令重采样与软牵引课程
         """
         manual_cmd_override = bool(getattr(self.cfg.env, "manual_cmd_override", False))
         if self.cfg.env.test and manual_cmd_override:
@@ -969,43 +1068,42 @@ class G1Robot(LeggedRobot):
 
         # 1. 基础采样：调用基类生成包含前后左右、自转的彻底随机全向指令
         super()._resample_commands(env_ids)
+        
         # 默认标记为“非探索样本”，仅在探索分支显式打开
         if hasattr(self, "explore_cmd_mask"):
             self.explore_cmd_mask[env_ids] = False
+        if hasattr(self, "alt_prev_lead_sign"):
+            self.alt_prev_lead_sign[env_ids] = 0.0
+        if hasattr(self, "alt_same_lead_steps"):
+            self.alt_same_lead_steps[env_ids] = 0.0
 
         # 2. 【概率软牵引课程】 (仅在三维地形上生效)
         if self.cfg.terrain.mesh_type == 'trimesh':
-            # max_level = self.cfg.terrain.num_rows - 1
 
             # 重采样时先刷新这批环境的高度，避免使用上一位置的旧测高
             if self.cfg.terrain.measure_heights and len(env_ids) > 0:
                 self.measured_heights[env_ids] = self._get_heights(env_ids)
 
             on_stairs_mask = self._estimate_on_stairs_mask(env_ids=env_ids, update_state=True)
-            # 测试模式默认不再强制楼梯态，避免 play/train 分布偏移；
-            # 如需复现旧行为，可在配置中显式设置 env.force_test_stairs_mode=True
             force_test_stairs_mode = bool(getattr(self.cfg.env, "force_test_stairs_mode", False))
             if self.cfg.env.test and force_test_stairs_mode:
                 on_stairs_mask = torch.ones_like(on_stairs_mask, dtype=torch.bool)
 
-            # rand_probs = torch.rand(len(env_ids), device=self.device)
-
-            # 【楼梯牵引】：100% 在楼梯上的机器人被正向牵引（视觉纠偏已恢复，不再需要随机探索）
+            # 【楼梯牵引】：100% 在楼梯上的机器人被正向牵引（严禁后退和大幅度横移）
             traction_mask = on_stairs_mask
 
             if traction_mask.any():
-                # a. 强制下达向前的指令 (0.40 ~ max m/s)，保持推进但避免过硬拉扯
+                # a. 强制下达向前的指令 (0.40 ~ max m/s)，保持推进
                 self.commands[env_ids[traction_mask], 0] = torch_rand_float(
                     0.40, self.command_ranges["lin_vel_x"][1],
                     (traction_mask.sum().item(), 1), device=self.device
                 ).squeeze(1)
 
-                # b. 收紧侧移 (乘以 0.1)，防止在爬楼梯时走出夸张的”螃蟹步”导致轻易绊倒
+                # b. 收紧侧移 (乘以 0.1)，防止在爬楼梯时走出夸张的”螃蟹步”
                 self.commands[env_ids[traction_mask], 1] *= 0.1
 
                 # c. 处理旋转指令
                 if self.cfg.commands.heading_command:
-                    # Heading 模式下，锁定为当前朝向，让视觉老司机平滑微调
                     from isaacgym.torch_utils import quat_apply
                     forward = quat_apply(self.base_quat[env_ids[traction_mask]], self.forward_vec[env_ids[traction_mask]])
                     current_heading = torch.atan2(forward[:, 1], forward[:, 0])
@@ -1013,14 +1111,14 @@ class G1Robot(LeggedRobot):
                 else:
                     self.commands[env_ids[traction_mask], 2] = 0.0
 
-            # 【平地上：前向牵引 + 少量零命令 + 少量探索】
+            # 【平地上：前向牵引 + 少量零命令 + 全向自由探索】
             flat_mask = ~on_stairs_mask
             if flat_mask.any():
                 flat_env_ids = env_ids[flat_mask]
-                flat_idle_prob = float(getattr(self.cfg.commands, "flat_idle_prob", 0.08))
-                flat_idle_prob = max(0.0, min(flat_idle_prob, 0.40))
-                flat_forward_prob = float(getattr(self.cfg.commands, "flat_forward_prob", 0.85))
-                flat_forward_prob = max(0.0, min(flat_forward_prob, 1.0))
+                
+                # 读取分布概率
+                flat_idle_prob = float(getattr(self.cfg.commands, "flat_idle_prob", 0.12))
+                flat_forward_prob = float(getattr(self.cfg.commands, "flat_forward_prob", 0.78))
                 flat_yaw_range = abs(float(getattr(self.cfg.commands, "flat_yaw_range", 0.1)))
 
                 flat_rand = torch.rand(len(flat_env_ids), device=self.device)
@@ -1040,13 +1138,15 @@ class G1Robot(LeggedRobot):
                     else:
                         self.commands[idle_env_ids, 2] = 0.0
 
+                # 有指令活动的机器人
                 if active_mask_flat.any():
                     active_env_ids = flat_env_ids[active_mask_flat]
-                    self.commands[active_env_ids, 0] = torch.clamp(self.commands[active_env_ids, 0], min=0.0)
                     active_rand = torch.rand(len(active_env_ids), device=self.device)
+                    
                     forward_mask_flat = active_rand < flat_forward_prob
+                    explore_mask_flat = ~forward_mask_flat
 
-                    # 主分支：前向牵引
+                    # 1. 前向牵引分支 (主流任务)
                     if forward_mask_flat.any():
                         forward_env_ids = active_env_ids[forward_mask_flat]
                         min_forward = min(0.25, float(self.command_ranges["lin_vel_x"][1]))
@@ -1054,6 +1154,7 @@ class G1Robot(LeggedRobot):
                             min_forward, self.command_ranges["lin_vel_x"][1],
                             (forward_mask_flat.sum().item(), 1), device=self.device
                         ).squeeze(1)
+                        # 前向走的时候依然收紧侧移
                         self.commands[forward_env_ids, 1] *= 0.05
                         if self.cfg.commands.heading_command:
                             from isaacgym.torch_utils import quat_apply
@@ -1066,19 +1167,26 @@ class G1Robot(LeggedRobot):
                                 (len(forward_env_ids), 1), device=self.device
                             ).squeeze(1)
 
-                    # 探索分支：保留随机性，但严格收窄平地侧移与转向
-                    explore_mask_flat = ~forward_mask_flat
+                    # 2. 全向自由探索分支 (那 10% 的环境)
                     if explore_mask_flat.any():
                         explore_env_ids = active_env_ids[explore_mask_flat]
-                        self.commands[explore_env_ids, 1] *= 0.2
+                        
+                        # 【核心改动】：
+                        # 1. 不修改 commands[:, 0]，保留基类生成的 [-1.0, 1.0] 的随机前后速度
+                        # 2. 不压缩 commands[:, 1]，保留基类生成的 [-0.5, 0.5] 的随机横移速度
+                        
                         if not self.cfg.commands.heading_command:
-                            explore_yaw = min(1.5 * flat_yaw_range, 0.25)
+                            # 稍微放开一点旋转限制，但不要转太快防止摔倒
+                            explore_yaw = min(2.0 * flat_yaw_range, 0.4)
                             self.commands[explore_env_ids, 2] = torch_rand_float(
                                 -explore_yaw, explore_yaw,
                                 (len(explore_env_ids), 1), device=self.device
                             ).squeeze(1)
+                            
+                        # 标记为探索样本，免除视觉老司机的纠偏，并给探索任务适当降权
                         if hasattr(self, "explore_cmd_mask"):
                             self.explore_cmd_mask[explore_env_ids] = True
+
     def _debug_visualize_training(self, depth_tensor):
         try:
             # --- 1. 数据准备 (保持原始数值不被破坏) ---
@@ -1187,7 +1295,7 @@ class G1Robot(LeggedRobot):
 
         self.gym.add_lines(self.viewer, self.envs[env_idx], 9, thick_verts_ax, thick_colors_rgb)
 
-    def _get_terrain_heights(self, env_ids, x, y):
+    def _get_terrain_heights(self, env_ids, x, y, interpolate=True):
         """
         [修复版] 根据世界坐标 (x, y) 获取地形高度
         """
@@ -1204,22 +1312,39 @@ class G1Robot(LeggedRobot):
         vertical_scale = self.cfg.terrain.vertical_scale
         border = self.cfg.terrain.border_size
 
-        # 3. 转换坐标
-        x_grid = (x + border) / horizontal_scale
-        y_grid = (y + border) / horizontal_scale  # 注意：这里假设 vertical_scale 和 horizontal_scale 相同，或者这是正方形网格
+        # 3. 转换坐标（连续网格坐标）
+        x_grid = (x.to(torch.float32) + border) / horizontal_scale
+        y_grid = (y.to(torch.float32) + border) / horizontal_scale
 
-        # 4. [核心修复] 使用真实的维度上限进行 Clip
-        # x 对应第 0 维 (rows), y 对应第 1 维 (cols)
-        x_grid_idx = torch.clip(x_grid.long(), 0, num_rows - 1)
+        # 4. 可选插值模式
+        x_grid = torch.clamp(x_grid, 0.0, float(num_rows - 1))
+        y_grid = torch.clamp(y_grid, 0.0, float(num_cols - 1))
 
-        # --- 修正点 ---
-        # 错误写法: y_grid_idx = torch.clip(y_grid_idx, 0, num_cols - 1)
-        # 正确写法: 应该使用 y_grid.long() 作为输入
-        y_grid_idx = torch.clip(y_grid.long(), 0, num_cols - 1)
+        # 边缘判定等几何任务可关闭插值，保留台阶立边的“硬边”特性
+        if not interpolate:
+            x_idx = torch.floor(x_grid).long()
+            y_idx = torch.floor(y_grid).long()
+            heights = self.height_samples[x_idx, y_idx].to(torch.float32)
+            return heights * vertical_scale
 
-        # 5. 查表
-        heights = self.height_samples[x_grid_idx, y_grid_idx] * vertical_scale
-        return heights
+        # 双线性插值（比整格取整更平滑，减少 10cm 量化抖动）
+        x0 = torch.floor(x_grid).long()
+        y0 = torch.floor(y_grid).long()
+        x1 = torch.clamp(x0 + 1, max=num_rows - 1)
+        y1 = torch.clamp(y0 + 1, max=num_cols - 1)
+
+        wx = x_grid - x0.to(torch.float32)
+        wy = y_grid - y0.to(torch.float32)
+
+        h00 = self.height_samples[x0, y0].to(torch.float32)
+        h10 = self.height_samples[x1, y0].to(torch.float32)
+        h01 = self.height_samples[x0, y1].to(torch.float32)
+        h11 = self.height_samples[x1, y1].to(torch.float32)
+
+        h0 = h00 * (1.0 - wx) + h10 * wx
+        h1 = h01 * (1.0 - wx) + h11 * wx
+        heights = h0 * (1.0 - wy) + h1 * wy
+        return heights * vertical_scale
 
     def _update_contact_metrics(self, hanging_mask, contact_mask):
         """ 统计全贴合率指标 """
@@ -1246,6 +1371,11 @@ class G1Robot(LeggedRobot):
         if hasattr(self, 'cached_start_h'):
             self.cached_start_h[env_ids] = 0.0
             self.cached_end_h[env_ids] = 0.0
+        if hasattr(self, 'cached_edge_obstacle_h'):
+            self.cached_edge_obstacle_h[env_ids] = 0.0
+        # 兼容旧缓存字段（历史 checkpoint）
+        if hasattr(self, 'cached_path_peak_h'):
+            self.cached_path_peak_h[env_ids] = 0.0
         if hasattr(self, 'on_stairs_state'):
             self.on_stairs_state[env_ids] = False
         if hasattr(self, 'on_stairs_conf_state'):
@@ -1371,7 +1501,7 @@ class G1Robot(LeggedRobot):
         task_mode_conf = forward_cmd_conf * lateral_task_conf
         progress_conf = torch.sigmoid((self.base_lin_vel[:, 0] - 0.03) / 0.08)
         # 台阶前卡住时保留推进牵引，不让奖励在低速时近似掉光
-        vel_gate = 0.45 + 0.55 * progress_conf
+        vel_gate = 0.12 + 0.88 * progress_conf
         # 保留“非楼梯优先”语义，同时在已上楼梯时仅保留很小尾巴，避免“台阶前刷分”主导
         # stair_conf=0 -> gate=1.0；stair_conf=1 -> gate=0.10
         gate = torch.clamp(0.10 + 0.90 * (1.0 - stair_conf), min=0.10, max=1.0)
@@ -1396,10 +1526,10 @@ class G1Robot(LeggedRobot):
             visual_seen_conf = torch.maximum(center_near_conf, center_step_conf)
         else:
             visual_seen_conf = torch.zeros(self.num_envs, device=self.device)
-        seen_boost = 0.35 + 0.65 * visual_seen_conf
+        seen_boost = 0.10 + 0.90 * visual_seen_conf
 
         # 探索样本降权（不是清零）：避免与“上楼任务奖励”冲突，同时保留少量泛化梯度
-        task_gate = cmd_x_gate * (0.20 + 0.80 * task_mode_conf)
+        task_gate = cmd_x_gate * (0.05 + 0.95 * task_mode_conf)
         explore_gate = self._get_explore_task_gate(default_weight=0.30)
         return height_match * near_stair * task_gate * vel_gate * gate * seen_boost * explore_gate
 
@@ -1421,7 +1551,7 @@ class G1Robot(LeggedRobot):
 
         near_stair_conf = torch.sigmoid((delta_h - 0.010) / 0.006)
         stair_conf = self._estimate_on_stairs_confidence(update_state=False)
-        pre_stair_gate = near_stair_conf * (1.0 - torch.clamp((stair_conf - 0.70) / 0.20, min=0.0, max=1.0))
+        pre_stair_gate = near_stair_conf * (1.0 - torch.clamp((stair_conf - 0.45) / 0.18, min=0.0, max=1.0))
 
         cmd_x_gate = (self.commands[:, 0] > 0.10).float()
         cmd_forward_conf = torch.sigmoid((self.commands[:, 0] - 0.08) / 0.06)
@@ -1429,7 +1559,7 @@ class G1Robot(LeggedRobot):
         # 不依赖 commands[:,2]（该通道会被视觉回调覆写），避免楼梯前转向阶段门控误降
         cmd_conf = cmd_x_gate * cmd_forward_conf * lateral_task_conf
         progress_conf = torch.sigmoid((self.base_lin_vel[:, 0] - 0.03) / 0.07)
-        progress_gate = 0.35 + 0.65 * progress_conf
+        progress_gate = 0.10 + 0.90 * progress_conf
 
         rows = float(max(self.cfg.terrain.num_rows, 1))
         difficulty = self.terrain_levels.float() / rows
@@ -1445,10 +1575,13 @@ class G1Robot(LeggedRobot):
         foot_dx_w = self.feet_pos[:, :, 0] - root_x
         foot_dy_w = self.feet_pos[:, :, 1] - root_y
         foot_x_body = cos_yaw * foot_dx_w + sin_yaw * foot_dy_w
-        step_reach = torch.sigmoid((torch.max(foot_x_body, dim=1).values - 0.16) / 0.05)
+        step_reach = torch.sigmoid((torch.max(foot_x_body, dim=1).values - 0.22) / 0.04)
+
+        swing_motion = torch.clamp(torch.max(torch.abs(self.feet_vel[:, :, 2]), dim=1).values / 0.20, min=0.0, max=1.0)
+        motion_gate = 0.05 + 0.95 * swing_motion
 
         explore_gate = self._get_explore_task_gate(default_weight=0.30)
-        return pre_stair_gate * cmd_conf * progress_gate * (0.6 * z_match + 0.4 * step_reach) * explore_gate
+        return pre_stair_gate * cmd_conf * progress_gate * motion_gate * (0.6 * z_match + 0.4 * step_reach) * explore_gate
     
     def _reward_stair_alternation(self):
         """
@@ -1466,6 +1599,7 @@ class G1Robot(LeggedRobot):
         # 2. 获取双脚的实际 Z 轴高度及高差
         left_foot_z = self.feet_pos[:, 0, 2]
         right_foot_z = self.feet_pos[:, 1, 2]
+        signed_z_diff = left_foot_z - right_foot_z
         z_diff = torch.abs(left_foot_z - right_foot_z)
         
         # 3. 【核心环境识别】：它现在到底在“爬楼”还是在“平台”上？
@@ -1504,13 +1638,77 @@ class G1Robot(LeggedRobot):
         stance_right_conf = torch.sigmoid((0.55 - phase_right) / 0.04)
         soft_double_stance = torch.minimum(stance_left_conf, stance_right_conf)
         support_gate = 0.30 + 0.70 * torch.sigmoid((min_fz - 4.0) / 3.0)
+
+        # 5.1 交替“换脚角色”约束：
+        # 不仅要求 |z_diff| 接近台阶高，还要求左右脚领先角色能随相位切换。
+        # 放宽角色切换识别窗口：让“换脚”约束覆盖更完整摆动段，减少单脚长期领步的 step-to 解
+        left_swing_conf = torch.sigmoid((phase_left - 0.52) / 0.07)
+        right_swing_conf = torch.sigmoid((phase_right - 0.52) / 0.07)
+        left_lead_mode = left_swing_conf * stance_right_conf
+        right_lead_mode = right_swing_conf * stance_left_conf
+        role_gate = torch.clamp(torch.maximum(left_lead_mode, right_lead_mode), min=0.0, max=1.0)
+        lead_conf = torch.maximum(left_lead_mode, right_lead_mode)
+        lead_sign = torch.where(
+            left_lead_mode > right_lead_mode + 0.04,
+            torch.ones_like(role_gate),
+            torch.where(
+                right_lead_mode > left_lead_mode + 0.04,
+                -torch.ones_like(role_gate),
+                torch.zeros_like(role_gate)
+            )
+        )
+        expected_signed_diff = (left_lead_mode - right_lead_mode) * target_step_height
+        sign_error = torch.abs(signed_z_diff - expected_signed_diff)
+        sign_sigma = 0.07
+        sign_match_reward = torch.exp(-torch.square(sign_error) / (2.0 * sign_sigma * sign_sigma))
         
         # 6. 推进门控：交替不仅要“形似”，还要伴随实际前向推进
         cmd_x_gate = (self.commands[:, 0] > 0.08).float()
         cmd_forward_conf = torch.sigmoid((self.commands[:, 0] - 0.08) / 0.06)
         progress_conf = torch.sigmoid((self.base_lin_vel[:, 0] - 0.06) / 0.05)
-        progress_gate = 0.35 + 0.65 * progress_conf
+        progress_gate = 0.15 + 0.85 * progress_conf
         common_forward = cmd_x_gate * torch.maximum(cmd_forward_conf, 0.6 * progress_conf)
+
+        # 6.0 领先脚角色“切换记忆”：
+        # 在楼梯前进任务下，若同一只脚持续领步过久则增惩，抑制 step-to 局部最优。
+        if not hasattr(self, "alt_prev_lead_sign"):
+            self.alt_prev_lead_sign = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
+        if not hasattr(self, "alt_same_lead_steps"):
+            self.alt_same_lead_steps = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
+
+        role_update_mask = (lead_conf > 0.42) & (bonus_stair_gate > 0.15) & (common_forward > 0.45)
+        prev_sign = self.alt_prev_lead_sign
+        same_lead = role_update_mask & (torch.abs(prev_sign) > 0.5) & (lead_sign == prev_sign) & (lead_sign != 0.0)
+        switched_lead = role_update_mask & (torch.abs(prev_sign) > 0.5) & (lead_sign != 0.0) & (lead_sign != prev_sign)
+
+        next_hold = torch.where(
+            same_lead,
+            self.alt_same_lead_steps + 1.0,
+            torch.where(switched_lead, torch.zeros_like(self.alt_same_lead_steps), self.alt_same_lead_steps)
+        )
+        inactive_reset = (bonus_stair_gate < 0.08) | (common_forward < 0.30)
+        self.alt_same_lead_steps = torch.where(inactive_reset, torch.zeros_like(next_hold), next_hold)
+
+        next_prev_sign = torch.where(role_update_mask & (lead_sign != 0.0), lead_sign, prev_sign)
+        self.alt_prev_lead_sign = torch.where(inactive_reset, torch.zeros_like(next_prev_sign), next_prev_sign)
+        same_lead_penalty = torch.clamp((self.alt_same_lead_steps - 10.0) / 14.0, min=0.0, max=1.2) * role_update_mask.float()
+
+        # 6.1 步宽/不交叉约束：抑制脚尖内扣、双脚过窄导致的蹭台阶侧面
+        yaw = self.rpy[:, 2]
+        root_x = self.root_states[:, 0].unsqueeze(1)
+        root_y = self.root_states[:, 1].unsqueeze(1)
+        cos_yaw = torch.cos(yaw).unsqueeze(1)
+        sin_yaw = torch.sin(yaw).unsqueeze(1)
+        foot_dx_w = self.feet_pos[:, :, 0] - root_x
+        foot_dy_w = self.feet_pos[:, :, 1] - root_y
+        foot_y_body = -sin_yaw * foot_dx_w + cos_yaw * foot_dy_w
+        # 左脚应在 +y，右脚应在 -y；step_width 越小越容易内扣/互相干涉
+        step_width = foot_y_body[:, 0] - foot_y_body[:, 1]
+        narrow_penalty = torch.clamp((0.14 - step_width) / 0.06, min=0.0, max=1.2)
+        cross_penalty = torch.clamp((-step_width) / 0.05, min=0.0, max=1.2)
+        lateral_penalty = (0.7 * narrow_penalty + 0.3 * cross_penalty) * common_forward * bonus_stair_gate
+        double_flight = ((left_fz < 1.0) & (right_fz < 1.0)).float()
+        hop_penalty = double_flight * common_forward * bonus_stair_gate * (0.25 + 0.75 * (1.0 - progress_conf))
         
         # 7. 误差惩罚 + 匹配奖励（返回“奖励-惩罚”，可正可负）
         # 为避免课程后期“负向尾巴过重”压制上楼动机：
@@ -1521,15 +1719,23 @@ class G1Robot(LeggedRobot):
 
         sigma = 0.24
         match_reward = torch.exp(-torch.square(norm_error) / (2.0 * sigma * sigma))
-        bonus_weight = 1.25
+        # 以 signed 约束为主：即使在 role_gate 较低阶段也保留一部分“左右角色”信息，
+        # 避免长期退化为单脚领步、另一脚跟随的 step-to 策略。
+        role_blend = 0.08 + 0.92 * role_gate
+        alternation_reward = (1.0 - role_blend) * match_reward + role_blend * sign_match_reward
+        bonus_weight = 1.55
         penalty_gate = common_forward * penalty_stair_gate * hard_double_stance.float() * hard_contact.float()
         bonus_gate = common_forward * bonus_stair_gate * soft_double_stance * support_gate * progress_gate
 
         penalty_signal = penalty_term * penalty_gate
-        bonus_signal = bonus_weight * match_reward * bonus_gate
-        stall_penalty = (1.0 - progress_conf) * common_forward * bonus_stair_gate * support_gate * 0.50
+        bonus_signal = bonus_weight * alternation_reward * bonus_gate
+        stall_penalty = (1.0 - progress_conf) * common_forward * bonus_stair_gate * support_gate * 0.40
         explore_gate = self._get_explore_task_gate(default_weight=0.30)
-        return torch.clamp(bonus_signal - penalty_signal - stall_penalty, min=-1.1, max=1.1) * explore_gate
+        return torch.clamp(
+            bonus_signal - penalty_signal - stall_penalty - 0.35 * lateral_penalty - 0.35 * same_lead_penalty - 0.30 * hop_penalty,
+            min=-1.1,
+            max=1.1
+        ) * explore_gate
 
     def _reward_foot_flatness(self):
         """
@@ -1580,85 +1786,208 @@ class G1Robot(LeggedRobot):
 
     def _reward_foot_support_rect(self):
         """
-        [专家强化版] 针对大落差台阶优化的踩空惩罚：
-        1. 引入 0.05m 物理死区，过滤地形微小噪声。
-        2. 保留摆动末期 (90% phase) 预警，但采用线性增压防止过度惩罚。
-        3. 结合支撑力反馈，确保“踩得越重，惩罚越严”。
+        以踝关节为核心的台阶支撑奖励（预计算边缘查表版）：
+        1) 先做四角点高度一致性快筛，非候选脚不做重检测；
+        2) 根据脚朝向确定前后轴（x/y 其一），按方向查最近 back/front 边缘；
+        3) 计算“踝到后沿边缘线”的垂直距离 + “脚尖到前沿立边”净距；
+        4) 按 5cm=0, 9cm=1, 13cm=0 打分，台阶外仍给负惩罚。
         """
-        # --- 1. 基础参数配置 ---
+        # 课程进度（用于阈值轻微收紧）
         progress = getattr(self, 'current_late_stage_progress',
                            getattr(self, 'current_terrain_progress', 0.0))
-        if isinstance(progress, torch.Tensor):
-            progress = progress.unsqueeze(1)
-        
-        # 动态边缘死区：从 0.05m 收缩到 0.025m
-        # 保留后期贴合要求，但避免阈值过苛导致“不敢抬腿”
-        edge_threshold = 0.05 - 0.025 * progress
-        
-        # 2. 定义脚掌四个角点的局部坐标 (前、后、侧向偏移)
-        dist_front, dist_back, dist_side = 0.12, -0.05, 0.03
-        corners_local = torch.tensor([
-            [dist_front,  dist_side, 0.0], [dist_front, -dist_side, 0.0],
-            [dist_back,   dist_side, 0.0], [dist_back,  -dist_side, 0.0]
-        ], device=self.device, dtype=torch.float32)
+        if torch.is_tensor(progress):
+            prog = progress.unsqueeze(1)
+        else:
+            prog = torch.full((self.num_envs, 1), float(progress), device=self.device)
 
-        # 3. 空间几何变换：将角点转到世界坐标系
-        feet_pos = self.feet_pos 
-        feet_rot = self.rigid_body_states_view[:, self.feet_indices, 3:7]
-        
-        # 广播并应用四元数旋转
-        feet_rot_exp = feet_rot.unsqueeze(2).repeat(1, 1, 4, 1)
-        corners_exp = corners_local.unsqueeze(0).unsqueeze(0).repeat(self.num_envs, self.feet_num, 1, 1)
-        
-        from isaacgym.torch_utils import quat_apply
-        corners_world = quat_apply(feet_rot_exp.view(-1, 4), corners_exp.view(-1, 3)).view(self.num_envs, self.feet_num, 4, 3)
-        corners_world += feet_pos.unsqueeze(2)
+        # 脚几何（来自你的约束）：前 12cm，后 5cm；台阶宽 30cm -> 踝可行域 13cm
+        front_len = 0.12
+        back_len = 0.05
+        half_width = 0.03
+        feasible_cap = 0.13
+        feasible_lower = 0.05  # 新增：下限 5cm
+        feasible_peak = 0.09
 
-        # 4. 地形高度采样
-        x_query, y_query = corners_world[..., 0].view(-1), corners_world[..., 1].view(-1)
-        # 从高度图中获取四个角点对应的地形高度
-        terrain_heights = self._get_terrain_heights(None, x_query, y_query).view(self.num_envs, self.feet_num, 4)
-        
-        # 5. 【核心计算】：计算脚下地形极差
-        h_range = torch.max(terrain_heights, dim=-1)[0] - torch.min(terrain_heights, dim=-1)[0]
+        feet_xy = self.feet_pos[:, :, :2]
+        ankle_x = feet_xy[:, :, 0]
+        ankle_y = feet_xy[:, :, 1]
+        ankle_h = self._get_terrain_heights(
+            None,
+            ankle_x.reshape(-1),
+            ankle_y.reshape(-1),
+            interpolate=False
+        ).view(self.num_envs, self.feet_num)
 
-        cliff_error = torch.clamp(h_range - edge_threshold, min=0.0)
-        
-        # 只有当 cliff_error 大于 0 时，才开始计算惩罚。
-        # 使用线性到饱和映射，减小“刚超阈值就重罚”的冲击
-        cliff_penalty = torch.clamp(cliff_error / 0.02, min=0.0, max=1.0)
-        
-        # --- 6. 【动态掩码逻辑】：响应你的预警需求 ---
-        # a. 支撑相 (Phase < 0.55)：全额激活惩罚 (1.0)
+        # 脚本体朝向（投影到水平面），比“机体前向”更能兼容脚斜着落地
+        feet_quat = self.rigid_body_states_view[:, self.feet_indices, 3:7]
+        x_axis = torch.zeros(self.num_envs * self.feet_num, 3, device=self.device, dtype=torch.float32)
+        x_axis[:, 0] = 1.0
+        foot_fwd_3d = quat_apply(feet_quat.reshape(-1, 4), x_axis).view(self.num_envs, self.feet_num, 3)
+        foot_fwd = foot_fwd_3d[:, :, :2]
+        foot_fwd_norm = torch.norm(foot_fwd, dim=-1, keepdim=True)
+        yaw = self.rpy[:, 2]
+        base_fwd = torch.stack([torch.cos(yaw), torch.sin(yaw)], dim=1).unsqueeze(1)
+        foot_fwd = torch.where(foot_fwd_norm > 1e-4, foot_fwd / (foot_fwd_norm + 1e-6), base_fwd)
+        foot_lat = torch.stack([-foot_fwd[:, :, 1], foot_fwd[:, :, 0]], dim=-1)
+
+        # 四角点：只用于“是否在台阶内”的软判定（不再要求四角齐平）
+        off_fb = torch.tensor([front_len, front_len, -back_len, -back_len], device=self.device, dtype=torch.float32).view(1, 1, 4, 1)
+        off_lr = torch.tensor([half_width, -half_width, half_width, -half_width], device=self.device, dtype=torch.float32).view(1, 1, 4, 1)
+        corners_xy = feet_xy.unsqueeze(2) + foot_fwd.unsqueeze(2) * off_fb + foot_lat.unsqueeze(2) * off_lr
+        corners_h = self._get_terrain_heights(
+            None,
+            corners_xy[..., 0].reshape(-1),
+            corners_xy[..., 1].reshape(-1),
+            interpolate=False
+        ).view(self.num_envs, self.feet_num, 4)
+
+        top_h = corners_h.max(dim=-1).values
+        # 后期略收紧“贴台阶面”的高度容差
+        support_tol = 0.015 - 0.004 * prog
+        close_to_top = torch.sigmoid((corners_h - (top_h.unsqueeze(-1) - support_tol.unsqueeze(-1))) / 0.0035)
+        support_ratio = close_to_top.mean(dim=-1)  # 1=明显在台阶内，0.5≈边缘，<0.5 越界
+
+        # 边缘为 0 的内外符号：inside >0, edge ~=0, outside <0
+        edge_signed = torch.clamp((support_ratio - 0.5) / 0.5, min=-1.0, max=1.0)
+        center_gap = torch.clamp(top_h - ankle_h, min=0.0)
+        center_on_top = torch.sigmoid((0.010 - center_gap) / 0.004)
+        signed_inout = torch.clamp(edge_signed, min=0.0) * center_on_top - \
+                       torch.clamp(-edge_signed, min=0.0) * (0.45 + 0.55 * torch.sigmoid((center_gap - 0.015) / 0.006))
+
+        # 四角一致性快筛：不一致说明在边界/台阶外，没必要做重检测
+        h_range = corners_h.amax(dim=-1) - corners_h.amin(dim=-1)
+        flat_candidate = h_range < (0.015 - 0.004 * prog)
+
+        # 根据脚朝向确定前后轴（x/y）
+        step = float(self.cfg.terrain.horizontal_scale)
+        border = float(self.cfg.terrain.border_size)
+
+        # 前后轴只处理对应坐标：若前后轴是 x，只处理 x；若是 y，只处理 y
+        use_x_axis = torch.abs(foot_fwd[:, :, 0]) >= torch.abs(foot_fwd[:, :, 1])
+        axis_sign = torch.where(use_x_axis, torch.sign(foot_fwd[:, :, 0]), torch.sign(foot_fwd[:, :, 1]))
+        axis_sign = torch.where(torch.abs(axis_sign) < 1e-5, torch.ones_like(axis_sign), axis_sign)
+        ankle_axis = torch.where(use_x_axis, feet_xy[:, :, 0], feet_xy[:, :, 1])
+        toe_xy = feet_xy + foot_fwd * front_len
+        toe_axis = torch.where(use_x_axis, toe_xy[:, :, 0], toe_xy[:, :, 1])
+
+        # 兜底边缘：仅按当前轴做 0.1m 量化（查表失效时保持信号连续）
+        q = (ankle_axis + border) / step
+        back_base = torch.where(
+            axis_sign > 0.0,
+            torch.floor(q + 1e-6) * step,
+            torch.ceil(q - 1e-6) * step
+        ) - border
+        front_base = torch.where(
+            axis_sign > 0.0,
+            torch.ceil(q - 1e-6) * step,
+            torch.floor(q + 1e-6) * step
+        ) - border
+        front_base_in = axis_sign * front_base
+        ankle_in = axis_sign * ankle_axis
+        front_base = torch.where(front_base_in <= ankle_in + 1e-6, front_base + axis_sign * step, front_base)
+        back_dist_fallback = torch.clamp(axis_sign * (ankle_axis - back_base), min=0.0)
+        toe_clear_fallback = axis_sign * (front_base - toe_axis)
+
+        back_dist = back_dist_fallback
+        toe_front_clear = toe_clear_fallback
+
+        # 查预计算边缘索引表（x/y + 正/负前向 + back/front）
+        if getattr(self, "has_stair_edge_lookup", False):
+            grid_rows, grid_cols = self.height_samples.shape
+            x_grid = (feet_xy[:, :, 0].to(torch.float32) + border) / step
+            y_grid = (feet_xy[:, :, 1].to(torch.float32) + border) / step
+            x_idx = torch.clamp(torch.floor(x_grid), 0, float(grid_rows - 1)).long()
+            y_idx = torch.clamp(torch.floor(y_grid), 0, float(grid_cols - 1)).long()
+
+            if (not hasattr(self, "rect_lateral_offsets")) or (self.rect_lateral_offsets.device != self.device):
+                self.rect_lateral_offsets = torch.tensor([-1, 0, 1], device=self.device, dtype=torch.long)
+            lat_offsets = self.rect_lateral_offsets
+            k = int(lat_offsets.numel())
+
+            x_idx_x = x_idx.unsqueeze(-1).expand(-1, -1, k)
+            y_idx_x = torch.clamp(y_idx.unsqueeze(-1) + lat_offsets.view(1, 1, -1), 0, grid_cols - 1)
+            x_idx_y = torch.clamp(x_idx.unsqueeze(-1) + lat_offsets.view(1, 1, -1), 0, grid_rows - 1)
+            y_idx_y = y_idx.unsqueeze(-1).expand(-1, -1, k)
+
+            back_idx_cand = torch.full((self.num_envs, self.feet_num, k), -1, device=self.device, dtype=torch.int32)
+            front_idx_cand = torch.full((self.num_envs, self.feet_num, k), -1, device=self.device, dtype=torch.int32)
+
+            mask_x_pos = use_x_axis & (axis_sign > 0.0)
+            mask_x_neg = use_x_axis & (axis_sign < 0.0)
+            mask_y_pos = (~use_x_axis) & (axis_sign > 0.0)
+            mask_y_neg = (~use_x_axis) & (axis_sign < 0.0)
+
+            if mask_x_pos.any():
+                back_idx_cand[mask_x_pos] = self.stair_edge_back_x_pos[x_idx_x[mask_x_pos], y_idx_x[mask_x_pos]].to(torch.int32)
+                front_idx_cand[mask_x_pos] = self.stair_edge_front_x_pos[x_idx_x[mask_x_pos], y_idx_x[mask_x_pos]].to(torch.int32)
+            if mask_x_neg.any():
+                back_idx_cand[mask_x_neg] = self.stair_edge_back_x_neg[x_idx_x[mask_x_neg], y_idx_x[mask_x_neg]].to(torch.int32)
+                front_idx_cand[mask_x_neg] = self.stair_edge_front_x_neg[x_idx_x[mask_x_neg], y_idx_x[mask_x_neg]].to(torch.int32)
+            if mask_y_pos.any():
+                back_idx_cand[mask_y_pos] = self.stair_edge_back_y_pos[x_idx_y[mask_y_pos], y_idx_y[mask_y_pos]].to(torch.int32)
+                front_idx_cand[mask_y_pos] = self.stair_edge_front_y_pos[x_idx_y[mask_y_pos], y_idx_y[mask_y_pos]].to(torch.int32)
+            if mask_y_neg.any():
+                back_idx_cand[mask_y_neg] = self.stair_edge_back_y_neg[x_idx_y[mask_y_neg], y_idx_y[mask_y_neg]].to(torch.int32)
+                front_idx_cand[mask_y_neg] = self.stair_edge_front_y_neg[x_idx_y[mask_y_neg], y_idx_y[mask_y_neg]].to(torch.int32)
+
+            inf = torch.full((self.num_envs, self.feet_num, k), 1e6, device=self.device, dtype=torch.float32)
+
+            back_edge_axis_cand = back_idx_cand.to(torch.float32) * step - border
+            back_dist_cand = axis_sign.unsqueeze(-1) * (ankle_axis.unsqueeze(-1) - back_edge_axis_cand)
+            valid_back = (back_idx_cand >= 0) & (back_dist_cand >= 0.0)
+            best_back_dist = torch.min(torch.where(valid_back, back_dist_cand, inf), dim=-1).values
+            has_back = best_back_dist < 1e5
+
+            front_edge_axis_cand = front_idx_cand.to(torch.float32) * step - border
+            toe_clear_cand = axis_sign.unsqueeze(-1) * (front_edge_axis_cand - toe_axis.unsqueeze(-1))
+            valid_front = (front_idx_cand >= 0) & (toe_clear_cand >= 0.0)
+            best_toe_clear = torch.min(torch.where(valid_front, toe_clear_cand, inf), dim=-1).values
+            has_front = best_toe_clear < 1e5
+
+            use_lookup = flat_candidate
+            back_dist = torch.where(use_lookup & has_back, best_back_dist, back_dist_fallback)
+            toe_front_clear = torch.where(use_lookup & has_front, best_toe_clear, toe_clear_fallback)
+
+        # 踝点到“后向台阶边缘线(x=c 或 y=c)”的垂直距离
+        d = torch.clamp(back_dist, min=0.0, max=feasible_cap)
+        # 在 5cm 边缘缓冲带内弱化“台阶外惩罚”，避免策略在台阶前不敢迈第一步
+        edge_relax = torch.sigmoid((d - feasible_lower) / 0.01)
+
+        # 脚尖到前向立边净距：越小越危险（防脚尖贴前方垂直面）
+        toe_riser_risk = torch.clamp((0.05 - toe_front_clear) / 0.05, min=0.0, max=1.5) * flat_candidate.float()
+
+        # 5cm=0, 9cm=1, 13cm=0；使用平滑余弦单峰，避免线性拐点不连续
+        rise_arg = torch.clamp((d - feasible_lower) / max(feasible_peak - feasible_lower, 1e-6), min=0.0, max=1.0)
+        fall_arg = torch.clamp((d - feasible_peak) / max(feasible_cap - feasible_peak, 1e-6), min=0.0, max=1.0)
+        rise = 0.5 - 0.5 * torch.cos(math.pi * rise_arg)
+        fall = 0.5 + 0.5 * torch.cos(math.pi * fall_arg)
+        dist_score = torch.where(d <= feasible_peak, rise, fall)
+        score_window = ((d >= feasible_lower) & (d <= feasible_cap)).float()
+        dist_score = dist_score * score_window
+        dist_score = torch.clamp(dist_score, min=0.0, max=1.0)
+        signed_rect = torch.where(signed_inout >= 0.0, signed_inout * dist_score, signed_inout)
+
+        # 相位/受力门控：支撑相奖励更可信；摆动末段只提前暴露负惩罚
         is_stance = (self.leg_phase < 0.55).float()
-        
-        # b. 摆动末期预警 (Phase 0.90 ~ 1.0)：线性增加权重 (0.0 -> 0.2)
-        # 这保证了机器人有“预防意识”，但不会因为空中的微小姿态偏差被处以极刑
-        is_pre_land = torch.clamp((self.leg_phase - 0.90) / 0.10, min=0.0, max=1.0) * 0.2
-        
-        # 融合后的动态激活掩码
-        dynamic_active_mask = torch.max(is_stance, is_pre_land)
-        
-        # 7. 【压力反馈】：踩实后的惩罚增压
-        # 只有真正承重时 (50N以上)，才认为踩空是极其严重的
+        is_pre_land = torch.clamp((self.leg_phase - 0.90) / 0.10, min=0.0, max=1.0)
         contact_force_z = self.contact_forces[:, self.feet_indices, 2]
-        contact_weight = torch.clamp(contact_force_z / 50.0, 0.0, 1.0)
-        
-        # 8. 楼梯门控：平地严格静音，边界软过渡
+        contact_w = torch.clamp(contact_force_z / 55.0, 0.0, 1.0)
+
+        pos_branch = torch.clamp(signed_rect, min=0.0) * is_stance * (0.30 + 0.70 * contact_w)
+        neg_branch = torch.clamp(-signed_rect, min=0.0) * torch.maximum(
+            is_stance * (0.45 + 0.55 * contact_w),
+            0.25 * is_pre_land
+        ) * (0.25 + 0.75 * edge_relax)
+        foot_signal = pos_branch - neg_branch - 0.35 * torch.clamp(signed_inout, min=0.0) * toe_riser_risk
+
+        # 楼梯门控：平地基本静音，台阶邻域逐步拉起
         if hasattr(self, "measured_heights"):
             stair_conf = self._estimate_on_stairs_confidence(update_state=False)
-            # 适度前移激活并保留极小底座：让“安全贴合”更早提供梯度，但不在边界重罚
-            underfoot_gate_core = torch.clamp((stair_conf - 0.28) / 0.48, min=0.0, max=1.0)
-            underfoot_gate = 0.05 + 0.95 * underfoot_gate_core
+            stair_gate = 0.05 + 0.95 * torch.clamp((stair_conf - 0.10) / 0.45, min=0.0, max=1.0)
         else:
-            underfoot_gate = torch.ones(self.num_envs, device=self.device)
+            stair_gate = torch.ones(self.num_envs, device=self.device)
 
-        # 9. 汇总：(边缘判定) * (动态预警掩码) * (物理压力权重) * (脚下台阶门控)
-        # 在空中靠 dynamic_active_mask 引导，落地后靠 contact_weight 适度增压
-        load_gain = 0.6 + 0.8 * contact_weight  # [0.6, 1.4]
-        total_penalty = cliff_penalty * dynamic_active_mask * load_gain * underfoot_gate.unsqueeze(1)
-        
-        return torch.sum(total_penalty, dim=1)
+        return torch.sum(foot_signal, dim=1) * stair_gate
 
     def _reward_stair_clearance(self):
         """
@@ -1702,7 +2031,7 @@ class G1Robot(LeggedRobot):
         # 3. 软补速：仅在“有前进意图且接近楼梯”时补速，避免卡住时过激落点预测
         cmd_norm = torch.norm(self.commands[:, :2], dim=1, keepdim=True)
         forward_conf = torch.sigmoid((cmd_norm - 0.10) / 0.05)
-        if hasattr(self, "measured_heights"):
+        if hasattr(self, "measured_heights") or getattr(self, "has_stair_edge_lookup", False):
             stair_conf = self._estimate_on_stairs_confidence(update_state=False).unsqueeze(1)
         else:
             stair_conf = torch.zeros_like(cmd_norm)
@@ -1731,11 +2060,110 @@ class G1Robot(LeggedRobot):
         curr_dy_b = -sin_yaw * curr_dx_w + cos_yaw * curr_dy_w
         landing_xy_err = torch.sqrt(torch.square(curr_dx_b - pred_dx_b) + torch.square(curr_dy_b - pred_dy_b) + 1e-6)
         landing_xy_match = torch.exp(-torch.square(landing_xy_err) / (2.0 * 0.16 * 0.16))
+        # 预测落足点的步宽走廊：抑制“脚尖过于靠内”的落足倾向
+        desired_lateral = torch.tensor([0.125, -0.125], device=self.device, dtype=torch.float32).unsqueeze(0)
+        pred_lateral_err = torch.abs(pred_dy_b - desired_lateral)
+        lateral_lane_match = torch.exp(-torch.square(pred_lateral_err) / (2.0 * 0.045 * 0.045))
+
         # ==========================================================
-        
+        # 基于预计算边缘查表的“脚尖-立边”风险评估（替代左右采样侧边惩罚）
+        # ==========================================================
+        feet_quat = self.rigid_body_states_view[:, self.feet_indices, 3:7]
+        x_axis = torch.zeros(self.num_envs * self.feet_num, 3, device=self.device, dtype=torch.float32)
+        x_axis[:, 0] = 1.0
+        foot_fwd_3d = quat_apply(feet_quat.reshape(-1, 4), x_axis).view(self.num_envs, self.feet_num, 3)
+        foot_fwd = foot_fwd_3d[:, :, :2]
+        foot_fwd_norm = torch.norm(foot_fwd, dim=-1, keepdim=True)
+        base_fwd = torch.stack([torch.cos(yaw), torch.sin(yaw)], dim=1).unsqueeze(1)
+        foot_fwd = torch.where(foot_fwd_norm > 1e-4, foot_fwd / (foot_fwd_norm + 1e-6), base_fwd)
+
+        use_x_axis = torch.abs(foot_fwd[:, :, 0]) >= torch.abs(foot_fwd[:, :, 1])
+        axis_sign = torch.where(use_x_axis, torch.sign(foot_fwd[:, :, 0]), torch.sign(foot_fwd[:, :, 1]))
+        axis_sign = torch.where(torch.abs(axis_sign) < 1e-5, torch.ones_like(axis_sign), axis_sign)
+
+        front_len = 0.12
+        step = float(self.cfg.terrain.horizontal_scale)
+        border = float(self.cfg.terrain.border_size)
+
+        if (not hasattr(self, "rect_lateral_offsets")) or (self.rect_lateral_offsets.device != self.device):
+            self.rect_lateral_offsets = torch.tensor([-1, 0, 1], device=self.device, dtype=torch.long)
+        lat_offsets = self.rect_lateral_offsets
+
+        def _query_front_clear(sample_xy, toe_xy):
+            sample_axis = torch.where(use_x_axis, sample_xy[..., 0], sample_xy[..., 1])
+            toe_axis = torch.where(use_x_axis, toe_xy[..., 0], toe_xy[..., 1])
+
+            q = (sample_axis + border) / step
+            front_base = torch.where(
+                axis_sign > 0.0,
+                torch.ceil(q - 1e-6) * step,
+                torch.floor(q + 1e-6) * step
+            ) - border
+            sample_in = axis_sign * sample_axis
+            front_in = axis_sign * front_base
+            front_base = torch.where(front_in <= sample_in + 1e-6, front_base + axis_sign * step, front_base)
+            toe_clear_fallback = axis_sign * (front_base - toe_axis)
+
+            if not getattr(self, "has_stair_edge_lookup", False):
+                return toe_clear_fallback
+
+            grid_rows, grid_cols = self.height_samples.shape
+            x_idx = torch.clamp(torch.floor((sample_xy[..., 0] + border) / step), 0, float(grid_rows - 1)).long()
+            y_idx = torch.clamp(torch.floor((sample_xy[..., 1] + border) / step), 0, float(grid_cols - 1)).long()
+            k = int(lat_offsets.numel())
+
+            x_idx_x = x_idx.unsqueeze(-1).expand(-1, -1, k)
+            y_idx_x = torch.clamp(y_idx.unsqueeze(-1) + lat_offsets.view(1, 1, -1), 0, grid_cols - 1)
+            x_idx_y = torch.clamp(x_idx.unsqueeze(-1) + lat_offsets.view(1, 1, -1), 0, grid_rows - 1)
+            y_idx_y = y_idx.unsqueeze(-1).expand(-1, -1, k)
+
+            front_idx = torch.full((self.num_envs, self.feet_num, k), -1, device=self.device, dtype=torch.int32)
+            mask_x_pos = use_x_axis & (axis_sign > 0.0)
+            mask_x_neg = use_x_axis & (axis_sign < 0.0)
+            mask_y_pos = (~use_x_axis) & (axis_sign > 0.0)
+            mask_y_neg = (~use_x_axis) & (axis_sign < 0.0)
+
+            if mask_x_pos.any():
+                front_idx[mask_x_pos] = self.stair_edge_front_x_pos[x_idx_x[mask_x_pos], y_idx_x[mask_x_pos]]
+            if mask_x_neg.any():
+                front_idx[mask_x_neg] = self.stair_edge_front_x_neg[x_idx_x[mask_x_neg], y_idx_x[mask_x_neg]]
+            if mask_y_pos.any():
+                front_idx[mask_y_pos] = self.stair_edge_front_y_pos[x_idx_y[mask_y_pos], y_idx_y[mask_y_pos]]
+            if mask_y_neg.any():
+                front_idx[mask_y_neg] = self.stair_edge_front_y_neg[x_idx_y[mask_y_neg], y_idx_y[mask_y_neg]]
+
+            edge_axis = front_idx.to(torch.float32) * step - border
+            toe_clear_cand = axis_sign.unsqueeze(-1) * (edge_axis - toe_axis.unsqueeze(-1))
+            valid = (front_idx >= 0) & (toe_clear_cand >= 0.0)
+            inf = torch.full_like(toe_clear_cand, 1e6)
+            best = torch.min(torch.where(valid, toe_clear_cand, inf), dim=-1).values
+            has_edge = best < 1e5
+            return torch.where(has_edge, best, toe_clear_fallback)
+
+        current_feet_xy = self.feet_pos[..., :2]
+        predicted_land_xy = torch.stack([predicted_land_x, predicted_land_y], dim=-1)
+        current_toe_xy = current_feet_xy + foot_fwd * front_len
+        predicted_toe_xy = predicted_land_xy + foot_fwd * front_len
+
+        current_front_clear = _query_front_clear(current_feet_xy, current_toe_xy)
+        pred_front_clear = _query_front_clear(predicted_land_xy, predicted_toe_xy)
+        front_edge_near_conf = torch.clamp((0.24 - current_front_clear) / 0.24, min=0.0, max=1.0)
+        front_riser_penalty = torch.clamp((0.05 - pred_front_clear) / 0.05, min=0.0, max=1.5)
+        front_clear_gate = torch.exp(-torch.square(torch.clamp(0.04 - pred_front_clear, min=0.0)) / (2.0 * 0.03 * 0.03))
+
         # --- 3. 实时采样原始地形高度 (带有突变风险的 Raw Data) ---
-        raw_start_h = self._get_terrain_heights(None, self.feet_pos[..., 0].view(-1), self.feet_pos[..., 1].view(-1)).view(self.num_envs, -1)
-        raw_end_h = self._get_terrain_heights(None, predicted_land_x.view(-1), predicted_land_y.view(-1)).view(self.num_envs, -1)
+        raw_start_h = self._get_terrain_heights(
+            None, self.feet_pos[..., 0].view(-1), self.feet_pos[..., 1].view(-1), interpolate=False
+        ).view(self.num_envs, -1)
+        raw_end_h = self._get_terrain_heights(
+            None, predicted_land_x.view(-1), predicted_land_y.view(-1), interpolate=False
+        ).view(self.num_envs, -1)
+        step_up_raw = torch.clamp(raw_end_h - raw_start_h, min=0.0, max=0.25)
+        raw_edge_obstacle_h = torch.clamp(
+            step_up_raw * (0.35 + 0.65 * front_edge_near_conf) + 0.03 * front_riser_penalty,
+            min=0.0,
+            max=0.20
+        )
         
         # ==========================================================
         # 👑 4. 【核心创新：双端高度锁存器 (Double-ended Height Latch)】
@@ -1744,6 +2172,7 @@ class G1Robot(LeggedRobot):
         if not hasattr(self, 'cached_start_h'):
             self.cached_start_h = torch.zeros((self.num_envs, self.feet_num), device=self.device)
             self.cached_end_h = torch.zeros((self.num_envs, self.feet_num), device=self.device)
+            self.cached_edge_obstacle_h = torch.zeros((self.num_envs, self.feet_num), device=self.device)
             
         # 判断当前腿是否踩在地上 (t == 0.0)
         is_stance = (t == 0.0)
@@ -1753,10 +2182,13 @@ class G1Robot(LeggedRobot):
         # 一旦脚起飞 (is_stance=False)，立即停止刷新，死死锁住起飞那一瞬间的高度！
         self.cached_start_h = torch.where(is_stance, raw_start_h, self.cached_start_h)
         self.cached_end_h = torch.where(is_stance, raw_end_h, self.cached_end_h)
+        self.cached_edge_obstacle_h = torch.where(is_stance, raw_edge_obstacle_h, self.cached_edge_obstacle_h)
         
         # 提取绝对稳定、无突变的起点和终点高度！
         current_terrain_h = self.cached_start_h
         future_terrain_h = self.cached_end_h
+        edge_obstacle_h = self.cached_edge_obstacle_h
+        path_peak_h = torch.maximum(current_terrain_h, future_terrain_h) + edge_obstacle_h
         # ==========================================================
         
         # --- 5. 基线插值轨迹规划 ---
@@ -1772,7 +2204,10 @@ class G1Robot(LeggedRobot):
         step_up_diff = torch.clamp(step_diff, min=0.0) 
         
         # 双目标抬腿带：低目标用于欠高惩罚，高目标用于奖励封顶
-        base_amplitude = 0.05 * cmd_vel_norm + 0.5 * step_up_diff
+        # 若路径中间有更高障碍（台阶立面/棱边），额外提高轨迹顶点
+        mid_obstacle_h = torch.clamp(edge_obstacle_h, min=0.0, max=0.20)
+        # 轻量引导：保留中段障碍抬高，但降低“超额抬腿”驱动力，避免跳步/探路脚固化
+        base_amplitude = 0.05 * cmd_vel_norm + 0.5 * step_up_diff + 0.45 * mid_obstacle_h
         low_height = 0.01 + base_amplitude
         high_height = 0.03 + base_amplitude
 
@@ -1782,6 +2217,12 @@ class G1Robot(LeggedRobot):
 
         target_h_low = linear_h + sine_lift_low
         target_h_high = linear_h + sine_lift_high
+        # 路径安全余量：中段轨迹至少高于路径峰值一小段，避免脚尖扫到台阶侧面
+        safety_margin = 0.02
+        path_needed = torch.clamp(path_peak_h + safety_margin - linear_h, min=0.0, max=0.18)
+        path_lift = path_needed * torch.pow(sin_term, 1.2)
+        target_h_low = target_h_low + 0.35 * path_lift
+        target_h_high = target_h_high + 0.65 * path_lift
         # ====================================================
         
         # --- 7. 分段信号：低于 low 罚分，low~high 给正奖励，>=high 封顶 1.0 ---
@@ -1794,33 +2235,38 @@ class G1Robot(LeggedRobot):
             min=0.0,
             max=1.0
         )
-        # 只抬高不往落足预测点推进时，奖励应下降，但不应被压成近零（避免信号过稀）
-        in_band_reward = in_band_reward * (0.45 + 0.55 * landing_xy_match)
+        # 只抬高不往落足预测点推进/不在步宽走廊/贴近侧边立面时，奖励都要下降
+        landing_gate = 0.05 + 0.45 * landing_xy_match + 0.50 * lateral_lane_match
+        in_band_reward = in_band_reward * landing_gate * front_clear_gate
 
         # 奖惩分支分开门控：
         # - 奖励分支：平地严格静音，楼梯边界平滑拉起
         # - 惩罚分支：比奖励更早激活，提前约束“贴地踢阶”风险
-        if hasattr(self, "measured_heights"):
+        if hasattr(self, "measured_heights") or getattr(self, "has_stair_edge_lookup", False):
             stair_conf = self._estimate_on_stairs_confidence(update_state=False)
             cmd_x_gate = (self.commands[:, 0] > 0.08).float()
             cmd_norm = torch.norm(self.commands[:, :2], dim=1)
             cmd_conf = cmd_x_gate * torch.sigmoid((cmd_norm - 0.10) / 0.05)
             progress_conf = torch.sigmoid((self.base_lin_vel[:, 0] - 0.05) / 0.05)
-            progress_gate = 0.35 + 0.65 * progress_conf
+            progress_gate = 0.20 + 0.80 * progress_conf
             # 奖励更早拉起、惩罚稍后拉起：降低台阶前“先罚后奖”卡死概率
-            reward_stair_gate = torch.clamp((stair_conf - 0.05) / 0.42, min=0.0, max=1.0)
-            penalty_stair_gate = torch.clamp((stair_conf - 0.20) / 0.52, min=0.0, max=1.0)
+            reward_stair_gate = torch.clamp((stair_conf - 0.03) / 0.36, min=0.0, max=1.0)
+            penalty_stair_gate = torch.clamp((stair_conf - 0.10) / 0.40, min=0.0, max=1.0)
             reward_gate = reward_stair_gate * cmd_conf * progress_gate
             penalty_gate = penalty_stair_gate * cmd_conf * (0.40 + 0.60 * progress_conf)
-            stall_penalty = (1.0 - progress_conf).unsqueeze(1) * in_band_reward * reward_stair_gate.unsqueeze(1) * cmd_conf.unsqueeze(1) * 0.45
+            front_penalty_gate = torch.clamp((stair_conf - 0.08) / 0.36, min=0.0, max=1.0) * cmd_conf * (0.55 + 0.45 * progress_conf)
+            stall_penalty = (1.0 - progress_conf).unsqueeze(1) * in_band_reward * reward_stair_gate.unsqueeze(1) * cmd_conf.unsqueeze(1) * 0.40
         else:
             reward_gate = torch.ones(self.num_envs, device=self.device)
             penalty_gate = torch.ones(self.num_envs, device=self.device)
+            front_penalty_gate = torch.ones(self.num_envs, device=self.device)
             stall_penalty = torch.zeros_like(in_band_reward)
 
         clearance_reward = in_band_reward * reward_gate.unsqueeze(1)
         clearance_penalty = low_penalty * penalty_gate.unsqueeze(1)
-        clearance_signal = clearance_reward - clearance_penalty - stall_penalty
+        front_riser_penalty_term = front_riser_penalty * front_penalty_gate.unsqueeze(1)
+        # 与 foot_support_rect 的脚尖立边惩罚去冗余：这里仅保留较弱的摆动期补充约束
+        clearance_signal = clearance_reward - clearance_penalty - stall_penalty - 0.18 * front_riser_penalty_term
 
         explore_gate = self._get_explore_task_gate(default_weight=0.30)
         return torch.sum(clearance_signal * is_swinging, dim=1) * explore_gate
@@ -1834,16 +2280,20 @@ class G1Robot(LeggedRobot):
         force_xy = torch.norm(forces[:, :, :2], dim=2) 
         force_z = torch.abs(forces[:, :, 2])
         
-        # 2. 计算绊倒比例，+5.0 避免除零，同时过滤掉极其微小的力噪声
-        stumble_ratio = force_xy / (force_z + 15.0)
+        # 2. 计算绊倒比例：降低归一化分母，提升对中等侧擦的敏感度
+        stumble_ratio = force_xy / (force_z + 6.0)
         
-        # 3. 构造惩罚映射：对中度及以上“踢台阶”事件触发（兼顾抗噪与敏感性）
+        # 3. 构造惩罚映射：对轻中度侧擦提前触发，对重度侧擦快速拉满
         # 使用 tanh 确保单步惩罚有上限值 1.0
-        penalty = torch.tanh(torch.clip(stumble_ratio - 1.8, min=0.0))
+        penalty = torch.tanh(torch.clip(stumble_ratio - 0.95, min=0.0))
         
         # 4. 物理过滤：只有总受力足够大时才计入惩罚，减少微小接触噪声影响
         total_force_norm = torch.norm(forces, dim=2)
-        force_threshold_mask = (total_force_norm > 12.0).float()
+        force_threshold_mask = (total_force_norm > 6.0).float()
+
+        # 摆动相“踢侧面”风险更高：对摆动腿侧擦事件放大惩罚
+        swing_conf = torch.sigmoid((self.leg_phase - 0.55) / 0.06)
+        stumble_gain = 0.85 + 0.70 * swing_conf
 
         # 5. 偏严格门控：脚下台阶起伏明确时才强激活，平地尽量静音
         if hasattr(self, "measured_heights"):
@@ -1852,13 +2302,21 @@ class G1Robot(LeggedRobot):
             cx, cy = nx // 2, ny // 2
             underfoot = g[:, max(0, cx - 2):min(nx, cx + 3), max(0, cy - 2):min(ny, cy + 3)]
             underfoot_range = underfoot.amax(dim=(1, 2)) - underfoot.amin(dim=(1, 2))
-            # 软门控：楼梯边界不过早重罚，真正上阶后再拉满
-            underfoot_conf = torch.sigmoid((underfoot_range - 0.055) / 0.010)
-            underfoot_gate = 0.02 + 0.98 * underfoot_conf
+            center = g[:, max(0, cx - 1):min(nx, cx + 2), max(0, cy - 1):min(ny, cy + 2)]
+            front = g[:, max(0, cx + 2):min(nx, cx + 6), max(0, cy - 1):min(ny, cy + 2)]
+            front_delta = torch.abs(front.mean(dim=(1, 2)) - center.mean(dim=(1, 2)))
+            # 软门控：脚下起伏 + 前方立面线索联合判定，提前在“台阶前沿”激活
+            underfoot_conf = torch.sigmoid((underfoot_range - 0.035) / 0.008)
+            front_conf = torch.sigmoid((front_delta - 0.012) / 0.004)
+            stair_like_conf = torch.maximum(underfoot_conf, front_conf)
+            underfoot_gate = 0.08 + 0.92 * stair_like_conf
         else:
             underfoot_gate = torch.ones(self.num_envs, device=self.device)
+
+        cmd_forward_conf = torch.sigmoid((self.commands[:, 0] - 0.08) / 0.05)
+        forward_gate = 0.35 + 0.65 * cmd_forward_conf
         
-        return torch.sum(penalty * force_threshold_mask, dim=1) * underfoot_gate
+        return torch.sum(penalty * force_threshold_mask * stumble_gain, dim=1) * underfoot_gate * forward_gate
 
     def _reward_pelvis_height(self):
         # 1. 提取盆骨绝对高度
@@ -1875,9 +2333,18 @@ class G1Robot(LeggedRobot):
         
         error = torch.abs(actual_height - target_height)
         
-        # 4. 允许 3cm 的微小死区
-        error = torch.clamp(error - 0.05, min=0.0)
-        return torch.exp(-torch.square(error) / 0.01)
+        # 4. 允许 3cm 的微小死区（比之前 5cm 更严格，抑制基座起伏/劈叉压低）
+        error = torch.clamp(error - 0.03, min=0.0)
+        height_reward = torch.exp(-torch.square(error) / 0.01)
+
+        # 5. 楼梯任务门控：在上楼阶段更强约束，平地只保留低强度底座
+        cmd_conf = torch.sigmoid((self.commands[:, 0] - 0.06) / 0.06)
+        if hasattr(self, "measured_heights"):
+            stair_conf = self._estimate_on_stairs_confidence(update_state=False)
+            height_gate = 0.25 + 0.75 * torch.maximum(stair_conf, 0.6 * cmd_conf)
+        else:
+            height_gate = 0.25 + 0.75 * cmd_conf
+        return height_reward * height_gate
 
     def _reward_tracking_lin_vel(self):
         """
@@ -1907,7 +2374,7 @@ class G1Robot(LeggedRobot):
         # 台阶邻域反怠速：临近楼梯却低推进时，线速度得分不能过高
         near_stair_conf = torch.sigmoid((stair_conf - 0.10) / 0.08)
         progress_conf = torch.sigmoid((self.base_lin_vel[:, 0] - 0.16) / 0.06)
-        anti_stall_gate = 1.0 - 0.45 * near_stair_conf * (1.0 - progress_conf) * forward_mask
+        anti_stall_gate = 1.0 - 0.55 * near_stair_conf * (1.0 - progress_conf) * forward_mask
 
         return lin_reward * gate * anti_spin_gate * anti_stall_gate
 
@@ -2048,24 +2515,34 @@ class G1Robot(LeggedRobot):
         return total_penalty * forward_command_mask * stair_gate
 
     def _reward_stand_still(self):
-        """
-        双功能：
-        1) 无命令时抑制前漂/转圈
-        2) 有明显前进命令时抑制怠工（不走或走太慢）
-        """
         cmd_planar = torch.norm(self.commands[:, :2], dim=1)
-        # “无速度命令”仅按平面速度指令判定，避免被视觉回调写入的 yaw 干扰
-        no_cmd_mask = (cmd_planar < 0.08).float()
+        no_cmd_mask = (cmd_planar < 0.05).float()
 
         idle_lin = torch.norm(self.base_lin_vel[:, :2], dim=1)
         idle_yaw = torch.abs(self.base_ang_vel[:, 2])
-        idle_lin_pen = torch.clamp((idle_lin - 0.04) / 0.12, min=0.0, max=1.0)
-        idle_yaw_pen = torch.clamp((idle_yaw - 0.10) / 0.35, min=0.0, max=1.0)
-        idle_penalty = idle_lin_pen + 0.5 * idle_yaw_pen
+        idle_ang_xy = torch.norm(self.base_ang_vel[:, :2], dim=1)
+        idle_lin_pen = torch.clamp((idle_lin - 0.03) / 0.10, min=0.0, max=1.0)
+        idle_yaw_pen = torch.clamp((idle_yaw - 0.08) / 0.25, min=0.0, max=1.0)
+        idle_ang_xy_pen = torch.clamp((idle_ang_xy - 0.08) / 0.25, min=0.0, max=1.0)
+        idle_penalty = idle_lin_pen + 0.5 * idle_yaw_pen + 0.4 * idle_ang_xy_pen
 
-        cmd_forward = (self.commands[:, 0] > 0.25).float()
-        low_progress = torch.clamp((0.12 - self.base_lin_vel[:, 0]) / 0.12, min=0.0, max=1.0)
-        return no_cmd_mask * idle_penalty + cmd_forward * low_progress
+        # 【核心修复】：基于二维平面合成速度评估怠工，兼容倒退和横移
+        cmd_active = (cmd_planar > 0.12).float()
+        target_v_planar = 0.24 * cmd_planar + 0.02
+        
+        actual_v_planar = torch.norm(self.base_lin_vel[:, :2], dim=1)
+        under_speed = torch.clamp(
+            (target_v_planar - actual_v_planar) / (target_v_planar + 0.12),
+            min=0.0,
+            max=1.0,
+        )
+        
+        # 方向背离惩罚：利用向量点乘判断。如果实际速度方向与指令方向夹角过大（点乘<0）则惩罚
+        dot_product = self.commands[:, 0] * self.base_lin_vel[:, 0] + self.commands[:, 1] * self.base_lin_vel[:, 1]
+        backtrack_pen = torch.clamp((-dot_product) / 0.12, min=0.0, max=1.0)
+        
+        low_progress = 0.75 * under_speed + 0.25 * backtrack_pen
+        return no_cmd_mask * idle_penalty + cmd_active * low_progress
 
     def _reward_contact(self):
         """ 奖励左右腿步态交替 """
@@ -2073,17 +2550,38 @@ class G1Robot(LeggedRobot):
         for i in range(self.feet_num):
             is_stance = self.leg_phase[:, i] < 0.55
             contact = self.contact_forces[:, self.feet_indices[i], 2] > 1.0
-            # 逻辑等价判定：如果触地状态符合相位要求，给正分
-            res += (contact == is_stance).float()
-            res -= (contact & ~is_stance).float()
-            # 新增：支撑相离地惩罚，专门抑制“短时失支撑/跳步”
-            res -= 0.7 * ((~contact) & is_stance).float()
-        # 推进门控：保留小保底，但去掉“无命令靠速度越动越拿分”的漏洞
+            stance_hit = (contact & is_stance).float()
+            swing_clear = ((~contact) & (~is_stance)).float()
+            swing_touch = (contact & (~is_stance)).float()
+            stance_miss = ((~contact) & is_stance).float()
+
+            # 支撑相正确触地 + 摆动相干净离地；拖步/失支撑给更重惩罚
+            res += 0.70 * stance_hit + 0.45 * swing_clear
+            res -= 0.95 * swing_touch
+            res -= 0.75 * stance_miss
+
+        # 推进门控：有命令但不推进时，contact 不应成为主要刷分来源
         cmd_speed = torch.norm(self.commands[:, :2], dim=1)
-        cmd_gate = torch.clamp((cmd_speed - 0.08) / 0.45, min=0.0, max=1.0)
-        contact_floor = 0.05
-        locomotion_gate = contact_floor + (1.0 - contact_floor) * cmd_gate
-        return res * locomotion_gate
+        cmd_gate = torch.clamp((cmd_speed - 0.06) / 0.32, min=0.0, max=1.0)
+        no_cmd_mask = (cmd_speed < 0.06).float()
+        progress_conf = torch.sigmoid((self.base_lin_vel[:, 0] - 0.07) / 0.05)
+        cmd_mode_gate = 0.08 + 0.92 * cmd_gate * (0.40 + 0.60 * progress_conf)
+
+        idle_lin = torch.norm(self.base_lin_vel[:, :2], dim=1)
+        idle_yaw = torch.abs(self.base_ang_vel[:, 2])
+        # 0 指令下保留小保底用于姿态微调；一旦漂移/转动，保底自动减弱
+        idle_stable_conf = torch.sigmoid((0.04 - idle_lin) / 0.02) * torch.sigmoid((0.10 - idle_yaw) / 0.05)
+        idle_floor = 0.012 + 0.028 * idle_stable_conf
+
+        locomotion_gate = (1.0 - no_cmd_mask) * cmd_mode_gate + no_cmd_mask * idle_floor
+
+        left_contact = self.contact_forces[:, self.feet_indices[0], 2] > 1.0
+        right_contact = self.contact_forces[:, self.feet_indices[1], 2] > 1.0
+        double_flight = ((~left_contact) & (~right_contact)).float()
+        cmd_forward = (self.commands[:, 0] > 0.08).float()
+        hop_penalty = double_flight * (0.15 + 0.85 * cmd_forward)
+
+        return res * locomotion_gate - 0.55 * hop_penalty
     
     def _reward_feet_swing_height(self):
         contact = torch.norm(self.contact_forces[:, self.feet_indices, :3], dim=2) > 1.
@@ -2116,13 +2614,14 @@ class G1Robot(LeggedRobot):
         # 因为 commands[:, 2] 已经是视觉算出来的、极其准确的避障转弯量了
         # 指令越大，自然给的腰部宽容度越大；指令为0，死区就严格限制在 0.05！
         yaw_vel_command = torch.abs(self.commands[:, 2]) 
-        yaw_tolerance = 0.05 + 0.3 * yaw_vel_command.unsqueeze(1)
+        # 收紧 yaw 宽容，抑制脚尖长期内扣导致的台阶侧擦
+        yaw_tolerance = 0.035 + 0.12 * yaw_vel_command.unsqueeze(1)
             
         error_yaw = torch.clamp(torch.abs(error[:, [0, 6]]) - yaw_tolerance, min=0.0)
         
         # 惩罚全部使用平方，保证平滑的梯度
         penalty_roll = torch.sum(torch.square(error_roll) * 1.0, dim=1)
         penalty_pitch = torch.sum(torch.square(error_pitch) * 1.0, dim=1) 
-        penalty_yaw = torch.sum(torch.square(error_yaw) * 1.0, dim=1)
+        penalty_yaw = torch.sum(torch.square(error_yaw) * 1.25, dim=1)
         
         return penalty_roll + penalty_pitch + penalty_yaw

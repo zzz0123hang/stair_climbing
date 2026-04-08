@@ -5,7 +5,7 @@ import torch
 import warp as wp
 import sys
 import os
-os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+# 调试 CUDA 内核错误时可临时设置：CUDA_LAUNCH_BLOCKING=1
 from sensors.warp.warp_stereo_cam import WarpStereoCam
 from legged_gym.utils.terrain import Terrain  # 导入机器人配置
 import math
