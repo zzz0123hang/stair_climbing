@@ -64,6 +64,8 @@ class G1RoughCfg( LeggedRobotCfg ):
         flat_idle_prob = 0.12
         # 非零样本里前向牵引比例
         flat_forward_prob = 0.78
+        # 楼梯牵引最小前进速度（降低后更利于稳定交替）
+        stair_min_forward = 0.30
         class ranges:
             lin_vel_x = [-0.5, 1.0] # min max [m/s]
             lin_vel_y = [-0.5, 0.5]   # min max [m/s]
@@ -106,7 +108,7 @@ class G1RoughCfg( LeggedRobotCfg ):
         # num_observations = 47 + 160
         # num_privileged_obs = 50 + 160
         num_observations = 790#本体感受(50)*3帧历史 + 视觉特征(640) = 790
-        num_privileged_obs = 980#学生(790) + 局部高度采样(187) + 物理参数(3) = 980
+        num_privileged_obs = 984#学生(790) + 局部高度采样(187) + 物理参数(3) + 梯度摘要(4) = 984
         
 
     # [恢复] 地形配置 (这对视觉训练很重要)

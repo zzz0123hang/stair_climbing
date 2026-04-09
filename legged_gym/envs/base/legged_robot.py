@@ -933,7 +933,11 @@ class LeggedRobot(BaseTask):
     def _reward_tracking_lin_vel(self):
         # Tracking of linear velocity commands (xy axes)
         lin_vel_error = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1)
-        return torch.exp(-lin_vel_error/self.cfg.rewards.tracking_sigma)
+        base_reward = torch.exp(-lin_vel_error/self.cfg.rewards.tracking_sigma)
+        # 0 指令附近软门控：抑制“无指令漂移也吃到 tracking 正奖”
+        cmd_norm = torch.norm(self.commands[:, :2], dim=1)
+        cmd_gate = torch.sigmoid((cmd_norm - 0.05) / 0.015)
+        return base_reward * cmd_gate
     
     def _reward_tracking_ang_vel(self):
         # Tracking of angular velocity commands (yaw) 
