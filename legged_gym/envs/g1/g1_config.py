@@ -165,6 +165,8 @@ class G1RoughCfg( LeggedRobotCfg ):
             "Diagnostics/planner_touch_count_step",
             "Diagnostics/planner_hit8_ema",
             "Diagnostics/planner_hit4_ema",
+            "Diagnostics/clearance_xy_err_ema",
+            "Diagnostics/clearance_z_err_ema",
             "Diagnostics/reset_rate_step",
             "Diagnostics/reset_no_cmd_share_step",
             "Diagnostics/reset_move_cmd_share_step",
@@ -314,7 +316,7 @@ class G1RoughCfg( LeggedRobotCfg ):
             # --- 基础运动奖励 ---
             tracking_lin_vel = 1.2
             # 显式惩罚摔倒终止，避免“猛冲几步后前扑”成为局部最优
-            termination = -8.0
+            termination = -20.0
             # 轻保底，避免“活着就有高分”掩盖主任务
             alive = 0.03
             # 关闭：与 stair_clearance 目标高度引导重叠，容易形成抬腿刷分
@@ -324,8 +326,8 @@ class G1RoughCfg( LeggedRobotCfg ):
             # ================= 核心惩罚 (全部必须为负数!) =================
             ang_vel_xy = -0.05          # [负向] 惩罚身体摇晃
             dof_acc = -1.5e-7           # [负向] 惩罚关节加速度过大 (省电、平滑)
-            # 抑制“无指令漂移”和“有指令怠工”
-            stand_still = -0.12
+            # 零指令稳定站立正向奖励（函数内部返回 0~1 的稳定分数）
+            stand_still = 0.18
             # ================= 楼梯专项（含奖励与惩罚） =================
             # 4. 惩罚摆动腿离地高度偏离目标值 (0.08m)
             # feet_swing_height = -1.5             

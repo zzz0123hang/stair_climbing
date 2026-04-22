@@ -295,6 +295,8 @@ class LeggedRobot(BaseTask):
         self.reset_buf[env_ids] = 1
         if hasattr(self, "termination_contact_over_limit_steps"):
             self.termination_contact_over_limit_steps[env_ids] = 0
+        if hasattr(self, "termination_pose_over_limit_steps"):
+            self.termination_pose_over_limit_steps[env_ids] = 0
         # fill extras
         self.extras["episode"] = {}
         episode_log_keys = getattr(self.cfg.env, "episode_reward_log_keys", None)
