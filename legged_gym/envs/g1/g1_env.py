@@ -1522,9 +1522,10 @@ class G1Robot(LeggedRobot):
 
         safe_update("tracking_lin_vel", 1.72 - 0.12 * late_stage_progress_smooth, per_env=True)
         # 稳定项：课程渐进 + 零命令失稳时自适应增压（不影响有指令推进路径）
+        # no_cmd 稳定项避免“每步大负分 > 一次摔倒罚分”导致的主动重置局部最优
         safe_update(
             "stand_still",
-            -0.38 - 0.40 * late_stage_progress_smooth - 0.30 * no_cmd_boost,
+            -0.08 - 0.12 * late_stage_progress_smooth - 0.10 * no_cmd_boost,
             per_env=True
         )
         self.dynamic_base_height_target = 0.72 + 0.03 * float(global_progress.item())
@@ -4803,6 +4804,17 @@ class G1Robot(LeggedRobot):
             + 1.55 * single_support
             + 2.75 * double_flight
         )
+        # 稳态双支撑减罚：鼓励“低速 + 低偏航 + 双脚着地”的站稳行为
+        stable_double_support = (left_contact & right_contact).float()
+        stable_motion = torch.exp(
+            -(
+                8.0 * lin_xy_sq
+                + 2.5 * yaw_rate_sq
+                + 2.0 * roll_sq
+                + 1.5 * pitch_sq
+            )
+        )
+        no_cmd_penalty = no_cmd_penalty - 1.4 * stable_double_support * stable_motion
         # reset 早期静止窗口更严格：专治“reset 后先乱摆/自旋再摔倒”。
         warm_steps = 45.0
         if hasattr(self, "episode_length_buf"):

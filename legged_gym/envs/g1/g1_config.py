@@ -314,7 +314,7 @@ class G1RoughCfg( LeggedRobotCfg ):
             # --- 基础运动奖励 ---
             tracking_lin_vel = 1.2
             # 显式惩罚摔倒终止，避免“猛冲几步后前扑”成为局部最优
-            termination = -5.0
+            termination = -8.0
             # 轻保底，避免“活着就有高分”掩盖主任务
             alive = 0.03
             # 关闭：与 stair_clearance 目标高度引导重叠，容易形成抬腿刷分
