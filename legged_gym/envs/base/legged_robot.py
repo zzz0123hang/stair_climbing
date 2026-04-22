@@ -123,10 +123,55 @@ class LeggedRobot(BaseTask):
     def check_termination(self):
         """ Check if environments need to be reset
         """
-        self.reset_buf = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1., dim=1)
-        self.reset_buf |= torch.logical_or(torch.abs(self.rpy[:,1])>1.0, torch.abs(self.rpy[:,0])>0.8)
+        contact_force_thr = float(getattr(self.cfg.env, "terminate_contact_force", 1.0))
+        contact_consecutive_steps = max(int(getattr(self.cfg.env, "terminate_contact_consecutive_steps", 1)), 1)
+        terminate_pitch = float(getattr(self.cfg.env, "terminate_pitch", 1.0))
+        terminate_roll = float(getattr(self.cfg.env, "terminate_roll", 0.8))
+        pose_consecutive_steps = max(int(getattr(self.cfg.env, "terminate_pose_consecutive_steps", 1)), 1)
+        contact_over_limit = torch.any(
+            torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > contact_force_thr,
+            dim=1
+        )
+        if not hasattr(self, "termination_contact_over_limit_steps"):
+            self.termination_contact_over_limit_steps = torch.zeros(
+                self.num_envs, dtype=torch.long, device=self.device, requires_grad=False
+            )
+        self.termination_contact_over_limit_steps = torch.where(
+            contact_over_limit,
+            self.termination_contact_over_limit_steps + 1,
+            torch.zeros_like(self.termination_contact_over_limit_steps),
+        )
+        contact_reset = self.termination_contact_over_limit_steps >= contact_consecutive_steps
+        pose_over_limit = torch.logical_or(
+            torch.abs(self.rpy[:, 1]) > terminate_pitch,
+            torch.abs(self.rpy[:, 0]) > terminate_roll
+        )
+        if not hasattr(self, "termination_pose_over_limit_steps"):
+            self.termination_pose_over_limit_steps = torch.zeros(
+                self.num_envs, dtype=torch.long, device=self.device, requires_grad=False
+            )
+        self.termination_pose_over_limit_steps = torch.where(
+            pose_over_limit,
+            self.termination_pose_over_limit_steps + 1,
+            torch.zeros_like(self.termination_pose_over_limit_steps),
+        )
+        pose_reset = self.termination_pose_over_limit_steps >= pose_consecutive_steps
         self.time_out_buf = self.episode_length_buf > self.max_episode_length # no terminal reward for time-outs
-        self.reset_buf |= self.time_out_buf
+        timeout_reset = self.time_out_buf
+        self.reset_reason_contact[:] = contact_reset
+        self.reset_reason_pose[:] = pose_reset
+        self.reset_reason_timeout[:] = timeout_reset
+        self.reset_buf = contact_reset | pose_reset | timeout_reset
+
+        if not hasattr(self, "extras"):
+            self.extras = {}
+        self.extras["Diagnostics/reset_rate_step"] = float(torch.mean(self.reset_buf.float()).item())
+        self.extras["Diagnostics/reset_reason_contact_rate_step"] = float(torch.mean(contact_reset.float()).item())
+        self.extras["Diagnostics/reset_reason_pose_rate_step"] = float(torch.mean(pose_reset.float()).item())
+        self.extras["Diagnostics/reset_reason_timeout_rate_step"] = float(torch.mean(timeout_reset.float()).item())
+        self.extras["Diagnostics/reset_reason_failure_rate_step"] = float(
+            torch.mean((contact_reset | pose_reset).float()).item()
+        )
 
     def reset_idx(self, env_ids):
         """ Reset some environments.
@@ -140,6 +185,87 @@ class LeggedRobot(BaseTask):
         """
         if len(env_ids) == 0:
             return
+
+        ended_lengths = self.episode_length_buf[env_ids].float()
+        if hasattr(self, "_get_no_cmd_mask"):
+            try:
+                ended_no_cmd_mask = self._get_no_cmd_mask()[env_ids]
+            except Exception:
+                try:
+                    ended_no_cmd_mask = self._get_no_cmd_mask(planar_thr=0.05, yaw_thr=0.05)[env_ids]
+                except Exception:
+                    ended_no_cmd_mask = torch.zeros(len(env_ids), dtype=torch.bool, device=self.device)
+        else:
+            cmd_planar = torch.norm(self.commands[env_ids, :2], dim=1)
+            if self.commands.shape[1] > 2:
+                yaw_abs = torch.abs(self.commands[env_ids, 2])
+            else:
+                yaw_abs = torch.zeros_like(cmd_planar)
+            planar_thr = float(getattr(self.cfg.commands, "no_cmd_planar_thr", 0.05)) if hasattr(self.cfg, "commands") else 0.05
+            yaw_thr = float(getattr(self.cfg.commands, "no_cmd_yaw_thr", 0.05)) if hasattr(self.cfg, "commands") else 0.05
+            ended_no_cmd_mask = (cmd_planar < planar_thr) & (yaw_abs < yaw_thr)
+        ended_move_cmd_mask = ~ended_no_cmd_mask
+        reset_contact = self.reset_reason_contact[env_ids]
+        reset_pose = self.reset_reason_pose[env_ids]
+        reset_timeout = self.reset_reason_timeout[env_ids]
+        reset_contact_only = reset_contact & (~reset_pose) & (~reset_timeout)
+        reset_pose_only = reset_pose & (~reset_contact) & (~reset_timeout)
+        reset_timeout_only = reset_timeout & (~reset_contact) & (~reset_pose)
+        reset_mixed = (reset_contact | reset_pose | reset_timeout) & (
+            ~(reset_contact_only | reset_pose_only | reset_timeout_only)
+        )
+
+        if not hasattr(self, "extras"):
+            self.extras = {}
+        reset_count = max(int(len(env_ids)), 1)
+        self.extras["Diagnostics/reset_count_step"] = float(len(env_ids))
+        self.extras["Diagnostics/reset_reason_contact_share_step"] = float(torch.sum(reset_contact.float()).item() / reset_count)
+        self.extras["Diagnostics/reset_reason_pose_share_step"] = float(torch.sum(reset_pose.float()).item() / reset_count)
+        self.extras["Diagnostics/reset_reason_timeout_share_step"] = float(torch.sum(reset_timeout.float()).item() / reset_count)
+        self.extras["Diagnostics/reset_reason_contact_only_share_step"] = float(torch.sum(reset_contact_only.float()).item() / reset_count)
+        self.extras["Diagnostics/reset_reason_pose_only_share_step"] = float(torch.sum(reset_pose_only.float()).item() / reset_count)
+        self.extras["Diagnostics/reset_reason_timeout_only_share_step"] = float(torch.sum(reset_timeout_only.float()).item() / reset_count)
+        self.extras["Diagnostics/reset_reason_mixed_share_step"] = float(torch.sum(reset_mixed.float()).item() / reset_count)
+        self.extras["Diagnostics/reset_no_cmd_share_step"] = float(torch.mean(ended_no_cmd_mask.float()).item())
+        self.extras["Diagnostics/reset_move_cmd_share_step"] = float(torch.mean(ended_move_cmd_mask.float()).item())
+
+        no_cmd_count = int(torch.sum(ended_no_cmd_mask.float()).item())
+        move_cmd_count = int(torch.sum(ended_move_cmd_mask.float()).item())
+        no_cmd_len_step = torch.mean(ended_lengths[ended_no_cmd_mask]) if no_cmd_count > 0 else torch.tensor(0.0, device=self.device)
+        move_cmd_len_step = torch.mean(ended_lengths[ended_move_cmd_mask]) if move_cmd_count > 0 else torch.tensor(0.0, device=self.device)
+        self.extras["Diagnostics/reset_episode_len_no_cmd_step"] = float(no_cmd_len_step.item())
+        self.extras["Diagnostics/reset_episode_len_move_cmd_step"] = float(move_cmd_len_step.item())
+
+        if no_cmd_count > 0:
+            ema_alpha = 0.06
+            self.reset_episode_len_no_cmd_ema = (1.0 - ema_alpha) * self.reset_episode_len_no_cmd_ema + \
+                ema_alpha * no_cmd_len_step.detach().unsqueeze(0)
+        if move_cmd_count > 0:
+            ema_alpha = 0.06
+            self.reset_episode_len_move_cmd_ema = (1.0 - ema_alpha) * self.reset_episode_len_move_cmd_ema + \
+                ema_alpha * move_cmd_len_step.detach().unsqueeze(0)
+        self.extras["Diagnostics/reset_episode_len_no_cmd_ema"] = float(self.reset_episode_len_no_cmd_ema.item())
+        self.extras["Diagnostics/reset_episode_len_move_cmd_ema"] = float(self.reset_episode_len_move_cmd_ema.item())
+
+        self.reset_cum_total += int(len(env_ids))
+        self.reset_cum_contact += int(torch.sum(reset_contact.float()).item())
+        self.reset_cum_pose += int(torch.sum(reset_pose.float()).item())
+        self.reset_cum_timeout += int(torch.sum(reset_timeout.float()).item())
+        self.reset_cum_no_cmd += no_cmd_count
+        self.reset_cum_move_cmd += move_cmd_count
+        if no_cmd_count > 0:
+            self.reset_cum_len_no_cmd += float(torch.sum(ended_lengths[ended_no_cmd_mask]).item())
+        if move_cmd_count > 0:
+            self.reset_cum_len_move_cmd += float(torch.sum(ended_lengths[ended_move_cmd_mask]).item())
+
+        reset_cum_total_safe = max(self.reset_cum_total, 1)
+        self.extras["Diagnostics/reset_reason_contact_share_cum"] = self.reset_cum_contact / reset_cum_total_safe
+        self.extras["Diagnostics/reset_reason_pose_share_cum"] = self.reset_cum_pose / reset_cum_total_safe
+        self.extras["Diagnostics/reset_reason_timeout_share_cum"] = self.reset_cum_timeout / reset_cum_total_safe
+        no_cmd_cum_safe = max(self.reset_cum_no_cmd, 1)
+        move_cmd_cum_safe = max(self.reset_cum_move_cmd, 1)
+        self.extras["Diagnostics/reset_episode_len_no_cmd_cum"] = self.reset_cum_len_no_cmd / no_cmd_cum_safe
+        self.extras["Diagnostics/reset_episode_len_move_cmd_cum"] = self.reset_cum_len_move_cmd / move_cmd_cum_safe
         
         # ================= [核心补丁] 激活课程学习 =================
         # 1. 更新地形课程：根据表现让机器人去更难的地形
@@ -167,10 +293,17 @@ class LeggedRobot(BaseTask):
         self.feet_air_time[env_ids] = 0.
         self.episode_length_buf[env_ids] = 0
         self.reset_buf[env_ids] = 1
+        if hasattr(self, "termination_contact_over_limit_steps"):
+            self.termination_contact_over_limit_steps[env_ids] = 0
         # fill extras
         self.extras["episode"] = {}
+        episode_log_keys = getattr(self.cfg.env, "episode_reward_log_keys", None)
+        allowed_episode_keys = None
+        if isinstance(episode_log_keys, (list, tuple, set)) and len(episode_log_keys) > 0:
+            allowed_episode_keys = set(episode_log_keys)
         for key in self.episode_sums.keys():
-            self.extras["episode"]['rew_' + key] = torch.mean(self.episode_sums[key][env_ids]) / self.max_episode_length_s
+            if (allowed_episode_keys is None) or (key in allowed_episode_keys):
+                self.extras["episode"]['rew_' + key] = torch.mean(self.episode_sums[key][env_ids]) / self.max_episode_length_s
             self.episode_sums[key][env_ids] = 0.
         if self.cfg.env.send_timeouts:
             self.extras["time_outs"] = self.time_out_buf
@@ -383,7 +516,14 @@ class LeggedRobot(BaseTask):
             self.root_states[env_ids] = self.base_init_state
             self.root_states[env_ids, :3] += self.env_origins[env_ids]
         # base velocities
-        self.root_states[env_ids, 7:13] = torch_rand_float(-0.5, 0.5, (len(env_ids), 6), device=self.device) # [7:10]: lin vel, [10:13]: ang vel
+        # 仅在 test/play 模式关闭初速度随机化，训练保持原有随机化能力
+        is_test_mode = bool(getattr(self.cfg.env, "test", False)) if hasattr(self.cfg, "env") else False
+        if is_test_mode:
+            self.root_states[env_ids, 7:13] = 0.0
+        else:
+            self.root_states[env_ids, 7:13] = torch_rand_float(
+                -0.5, 0.5, (len(env_ids), 6), device=self.device
+            ) # [7:10]: lin vel, [10:13]: ang vel
         env_ids_int32 = env_ids.to(dtype=torch.int32)
         self.gym.set_actor_root_state_tensor_indexed(self.sim,
                                                      gymtorch.unwrap_tensor(self.root_states),
@@ -393,7 +533,19 @@ class LeggedRobot(BaseTask):
         """ Random pushes the robots. Emulates an impulse by setting a randomized base velocity. 
         """
         env_ids = torch.arange(self.num_envs, device=self.device)
-        push_env_ids = env_ids[self.episode_length_buf[env_ids] % int(self.cfg.domain_rand.push_interval) == 0]
+        push_interval = max(int(getattr(self.cfg.domain_rand, "push_interval", 1)), 1)
+        push_warmup = int(getattr(self.cfg.domain_rand, "push_warmup", 0))
+        ep_len = self.episode_length_buf[env_ids]
+        trigger_mask = (ep_len % push_interval == 0) & (ep_len >= push_warmup)
+        push_env_ids = env_ids[trigger_mask]
+        # 避免“零指令静止样本”被外力污染：推搡仅作用于有运动命令的样本
+        if len(push_env_ids) > 0 and hasattr(self, "_get_no_cmd_mask"):
+            try:
+                no_cmd_mask = self._get_no_cmd_mask()
+            except TypeError:
+                no_cmd_mask = self._get_no_cmd_mask(planar_thr=0.05, yaw_thr=0.05)
+            if torch.is_tensor(no_cmd_mask) and no_cmd_mask.shape[0] == self.num_envs:
+                push_env_ids = push_env_ids[~no_cmd_mask[push_env_ids]]
         if len(push_env_ids) == 0:
             return
         max_vel = float(self.cfg.domain_rand.max_push_vel_xy)
@@ -455,12 +607,13 @@ class LeggedRobot(BaseTask):
         if len(final_distance) > 0:
             if not hasattr(self, "extras"):
                 self.extras = {}
-            # 兼容原有看板：distance 指标改为“本回合最远距离”
+            # 兼容原有看板：默认保留两条核心距离曲线，细节可按需开启
+            distance_detail = bool(getattr(self.cfg.env, "log_distance_detail_metrics", False))
             self.extras["Metrics/mean_distance"] = torch.mean(max_distance).item()
-            self.extras["Metrics/max_distance"] = torch.max(max_distance).item()
-            # 附加终点位移，便于对比“能力”与“收官稳定”
             self.extras["Metrics/mean_distance_final"] = torch.mean(final_distance).item()
-            self.extras["Metrics/max_distance_final"] = torch.max(final_distance).item()
+            if distance_detail:
+                self.extras["Metrics/max_distance"] = torch.max(max_distance).item()
+                self.extras["Metrics/max_distance_final"] = torch.max(final_distance).item()
         # 3. 升级逻辑：支持按任务配置覆盖升级距离阈值
         move_up_distance = getattr(self.cfg.terrain, "curriculum_move_up_distance",
                                    self.cfg.terrain.terrain_length / 2.0)
@@ -495,18 +648,20 @@ class LeggedRobot(BaseTask):
         if len(env_ids) > 0:
             if not hasattr(self, "extras"):
                 self.extras = {}
-            # 升级诊断指标：显式拆分每个 gate，避免把 stair_gate 误读为最终升级条件
+            # 升级诊断指标：默认只保留关键两条；细分 gate 曲线按需开启
+            gate_detail = bool(getattr(self.cfg.env, "log_curriculum_gate_details", False))
             stair_nav_gate = stair_gate & nav_gate
             joint_gate = dist_gate & stair_gate & nav_gate
-            self.extras["Metrics/move_up_dist_gate_rate"] = torch.mean(dist_gate.float()).item()
-            self.extras["Metrics/move_up_stair_gate_rate"] = torch.mean(stair_gate.float()).item()
-            self.extras["Metrics/move_up_nav_gate_rate"] = torch.mean(nav_gate.float()).item()
             self.extras["Metrics/move_up_stair_nav_gate_rate"] = torch.mean(stair_nav_gate.float()).item()
-            self.extras["Metrics/move_up_joint_gate_rate"] = torch.mean(joint_gate.float()).item()
             self.extras["Metrics/move_up_ready_rate"] = torch.mean(move_up.float()).item()
+            if gate_detail:
+                self.extras["Metrics/move_up_dist_gate_rate"] = torch.mean(dist_gate.float()).item()
+                self.extras["Metrics/move_up_stair_gate_rate"] = torch.mean(stair_gate.float()).item()
+                self.extras["Metrics/move_up_nav_gate_rate"] = torch.mean(nav_gate.float()).item()
+                self.extras["Metrics/move_up_joint_gate_rate"] = torch.mean(joint_gate.float()).item()
 
             # 平地转圈倾向诊断：横摆/偏航相对前向推进的比值
-            if hasattr(self, "episode_abs_vx_sum") and hasattr(self, "episode_abs_vy_sum") and \
+            if gate_detail and hasattr(self, "episode_abs_vx_sum") and hasattr(self, "episode_abs_vy_sum") and \
                hasattr(self, "episode_abs_wz_sum") and hasattr(self, "episode_nav_steps"):
                 nav_steps_diag = torch.clamp(self.episode_nav_steps[env_ids].float(), min=1.0)
                 mean_abs_vx = self.episode_abs_vx_sum[env_ids] / nav_steps_diag
@@ -660,6 +815,22 @@ class LeggedRobot(BaseTask):
         self.commands_scale = torch.tensor([self.obs_scales.lin_vel, self.obs_scales.lin_vel, self.obs_scales.ang_vel], device=self.device, requires_grad=False,) # TODO change this
         self.feet_air_time = torch.zeros(self.num_envs, self.feet_indices.shape[0], dtype=torch.float, device=self.device, requires_grad=False)
         self.last_contacts = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.bool, device=self.device, requires_grad=False)
+        self.reset_reason_contact = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
+        self.reset_reason_pose = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
+        self.reset_reason_timeout = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
+        self.reset_episode_len_no_cmd_ema = torch.zeros(1, dtype=torch.float, device=self.device, requires_grad=False)
+        self.reset_episode_len_move_cmd_ema = torch.zeros(1, dtype=torch.float, device=self.device, requires_grad=False)
+        self.reset_cum_total = 0
+        self.reset_cum_contact = 0
+        self.reset_cum_pose = 0
+        self.reset_cum_timeout = 0
+        self.reset_cum_no_cmd = 0
+        self.reset_cum_move_cmd = 0
+        self.reset_cum_len_no_cmd = 0.0
+        self.reset_cum_len_move_cmd = 0.0
+        self.termination_contact_over_limit_steps = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device, requires_grad=False
+        )
         self.base_lin_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
         self.base_ang_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
         self.projected_gravity = quat_rotate_inverse(self.base_quat, self.gravity_vec)
@@ -848,6 +1019,8 @@ class LeggedRobot(BaseTask):
         self.max_episode_length = np.ceil(self.max_episode_length_s / self.dt)
 
         self.cfg.domain_rand.push_interval = np.ceil(self.cfg.domain_rand.push_interval_s / self.dt)
+        push_warmup_s = float(getattr(self.cfg.domain_rand, "push_warmup_s", 0.0))
+        self.cfg.domain_rand.push_warmup = np.ceil(max(push_warmup_s, 0.0) / self.dt)
 
 
     #------------ reward functions----------------

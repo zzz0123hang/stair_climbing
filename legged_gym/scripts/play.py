@@ -73,16 +73,20 @@ def play(args):
     # --- 覆盖参数以适应 Play 模式 ---
     env_cfg.env.num_envs = min(env_cfg.env.num_envs, 9)  # 只开几个环境测试
     env_cfg.init_state.pos = [0.0, 0.0, 0.8]
+    # Play 固定楼梯评测集：0.11~0.15m 递增台阶（5x5，越往后越高）
     env_cfg.terrain.num_rows = 5
     env_cfg.terrain.num_cols = 5
-    env_cfg.terrain.curriculum = False
+    env_cfg.terrain.curriculum = True
+    env_cfg.terrain.terrain_proportions = [0.0, 0.0, 1.0, 0.0, 0.0]
+    env_cfg.terrain.stair_height_levels = [0.11, 0.12, 0.13, 0.14, 0.15]
     env_cfg.noise.add_noise = False
     env_cfg.domain_rand.randomize_friction = False
     env_cfg.domain_rand.push_robots = False
     env_cfg.commands.heading_command = False
     env_cfg.commands.resampling_time = 1e9
-    # 保持与训练分布一致：允许视觉回调参与 yaw 纠偏（仅手动下发线速度）
+    # Play 手动评测：保留视觉回调，但仅在前进任务时允许其接管 yaw
     env_cfg.env.manual_cmd_override = False
+    env_cfg.env.allow_test_resample = False
     
     # 【重要】确保相机开启，否则神经网络输入维度会不匹配
     # 虽然不显示图像，但必须产生数据给 Policy 使用
@@ -103,6 +107,11 @@ def play(args):
 
     # 自定义记录器字典
     data_log = {}
+    play_reward_log_keys = getattr(env_cfg.env, "episode_reward_log_keys", None)
+    if isinstance(play_reward_log_keys, (list, tuple, set)) and len(play_reward_log_keys) > 0:
+        play_reward_log_keys = set(play_reward_log_keys)
+    else:
+        play_reward_log_keys = None
     robot_index = 0
     # 导出 JIT (可选)
     if EXPORT_POLICY:
@@ -137,13 +146,35 @@ def play(args):
                 env.commands[:, 1] = current_lin_vel_y
                 # 当前为 heading_command=False，必须写到 commands[:, 2]
                 env.commands[:, 2] = current_ang_vel_yaw
-                cmd_x, cmd_y, cmd_yaw = current_lin_vel_x, current_lin_vel_y, current_ang_vel_yaw
+                req_cmd_x, req_cmd_y, req_cmd_yaw = current_lin_vel_x, current_lin_vel_y, current_ang_vel_yaw
             
             # 3. 环境步进
+            applied_cmd = env.commands[0, :3].detach().cpu().clone()
             obs, _, rews, dones, infos = env.step(actions.detach())
             if step_counter % print_every_n_steps == 0:
                 vel_x = env.base_lin_vel[0, 0].item()
-                print(f"[PLAY CMD] x={cmd_x:.2f}, y={cmd_y:.2f}, yaw={cmd_yaw:.2f} | vel_x={vel_x:.2f}")
+                vel_y = env.base_lin_vel[0, 1].item()
+                yaw_rate = env.base_ang_vel[0, 2].item()
+                if hasattr(env, "rpy"):
+                    body_roll = env.rpy[0, 0].item()
+                    body_pitch = env.rpy[0, 1].item()
+                    body_yaw = env.rpy[0, 2].item()
+                else:
+                    body_roll = float("nan")
+                    body_pitch = float("nan")
+                    body_yaw = float("nan")
+                exec_cmd_x = env.commands[0, 0].item()
+                exec_cmd_y = env.commands[0, 1].item()
+                exec_cmd_yaw = env.commands[0, 2].item()
+                done0 = bool(dones[0].item()) if torch.is_tensor(dones) else bool(dones[0])
+                print(
+                    f"[PLAY CMD] req(x={req_cmd_x:.2f}, y={req_cmd_y:.2f}, yaw={req_cmd_yaw:.2f}) "
+                    f"| applied(x={applied_cmd[0]:.2f}, y={applied_cmd[1]:.2f}, yaw={applied_cmd[2]:.2f}) "
+                    f"| post(x={exec_cmd_x:.2f}, y={exec_cmd_y:.2f}, yaw={exec_cmd_yaw:.2f}) "
+                    f"| done={int(done0)} "
+                    f"| vel_x={vel_x:.2f}, vel_y={vel_y:.2f}, yaw_rate={yaw_rate:.2f}, "
+                    f"body_roll={body_roll:.2f}, body_pitch={body_pitch:.2f}, body_yaw={body_yaw:.2f}"
+                )
             # --- 实时记录逻辑 ---
             # --- 实时记录逻辑 ---
             if step_counter % record_every_n_steps == 0:
@@ -158,6 +189,8 @@ def play(args):
 
                 # B. 动态记录所有分项奖励
                 for name in env.reward_names:
+                    if (play_reward_log_keys is not None) and (name not in play_reward_log_keys):
+                        continue
                     key = f'rew_{name}'
                     if key not in data_log: data_log[key] = []
                     # 直接读取环境在本步已计算好的分项奖励，避免二次调用有状态奖励函数污染结果

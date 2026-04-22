@@ -40,7 +40,7 @@ class G1RoughCfg( LeggedRobotCfg ):
             visual_handover_end_gain = 0.65
             # 对齐奖励全程底座门控，避免远离楼梯时完全无约束
             align_global_floor = 0.12
-            # 视觉“看到台阶线索”判定（用于 vision_stair_drive 的增强门控）
+            # 视觉“看到台阶线索”判定（用于 stair_alignment 的增强门控）
             vision_seen_depth_thresh = 1.25
             vision_seen_depth_sigma = 0.18
             vision_seen_edge_thresh = 0.10
@@ -60,12 +60,34 @@ class G1RoughCfg( LeggedRobotCfg ):
         heading_command = False#heading_command = True # if true: compute ang vel command from heading error
         # 平地随机角速度范围（_resample_commands 中使用）
         flat_yaw_range = 0.1
-        # 平地重采样时给少量“零命令”样本，训练无指令静止（避免占比过大影响主任务）
-        flat_idle_prob = 0.12
+        # 平地零命令样本占比（受全局 no_cmd governor 约束）
+        flat_idle_prob = 0.14
         # 非零样本里前向牵引比例
         flat_forward_prob = 0.78
         # 楼梯牵引最小前进速度（过高会抑制交替稳定并提高摔倒率）
         stair_min_forward = 0.30
+        # 楼梯区保留少量零指令样本：静止能力不断档，但不压过上楼主任务
+        stair_idle_prob = 0.03
+        stair_idle_prob_early = 0.05
+        stair_idle_prob_late = 0.02
+        # 全局 no_cmd 比例目标带：主任务优先，同时保留静止能力
+        target_no_cmd_rate = 0.12
+        target_no_cmd_rate_low = 0.08
+        target_no_cmd_rate_high = 0.16
+        # 楼梯牵引样本里的 no_cmd 硬上限（剩余 no_cmd 配额优先分给 flat）
+        stair_idle_hard_cap_ratio = 0.05
+        # 默认零指令连续片段锁存时长（秒）：用于平地静止训练
+        no_cmd_hold_min_s = 2.0
+        no_cmd_hold_max_s = 3.2
+        # 楼梯活跃样本上的零指令短锁存：保留静止能力，同时不打断爬楼主任务
+        stair_no_cmd_hold_min_s = 0.6
+        stair_no_cmd_hold_max_s = 1.2
+        # 平地静止样本锁存（与默认一致，显式化便于调参）
+        flat_no_cmd_hold_min_s = 2.0
+        flat_no_cmd_hold_max_s = 3.2
+        # 统一零指令判据阈值（所有 no_cmd 门控共用）
+        no_cmd_planar_thr = 0.05
+        no_cmd_yaw_thr = 0.05
         class ranges:
             lin_vel_x = [-0.5, 1.0] # min max [m/s]
             lin_vel_y = [-0.5, 0.5]   # min max [m/s]
@@ -103,12 +125,69 @@ class G1RoughCfg( LeggedRobotCfg ):
         num_actions = 12
         # 课程升降级详细打印（默认关闭，避免大规模并行训练被日志拖慢）
         log_curriculum_events = False
+        # 课程 gate 细分指标：先关闭，减少训练日志开销
+        log_curriculum_gate_details = False
+        # 距离明细指标：先关闭，必要时再用于定位问题
+        log_distance_detail_metrics = False
+        # 回合奖励曲线白名单：保留核心训练信号 + 少量可排障分项
+        episode_reward_log_keys = [
+            "tracking_lin_vel",
+            "tracking_ang_vel",
+            "stand_still",
+            "stair_clearance",
+            "stair_alternation",
+            "planner_tracking",
+            "foot_support_rect",
+            "first_step_commit",
+            "orientation",
+            "pelvis_height",
+            "contact",
+            "termination",
+            "alive",
+            "action_rate",
+        ]
+        # 实时 extras 白名单：保留课程推进、零指令稳定性、planner 闭环与调度关键信号
+        # Metrics/ 走前缀放行：恢复原有课程/地形相关曲线，避免 key 变动时被白名单误杀。
+        wandb_extra_prefixes_keep = [
+            "Metrics/",
+        ]
+        wandb_extra_keys_keep = [
+            "metrics/full_contact_rate",
+            "Diagnostics/sched_planner_miss_boost",
+            "Diagnostics/sched_no_cmd_boost",
+            "Diagnostics/no_cmd_rate",
+            "Diagnostics/no_cmd_hold_rate",
+            "Diagnostics/no_cmd_yaw_rate_mean",
+            "Diagnostics/no_cmd_instability_ema",
+            "Diagnostics/no_cmd_single_support_rate",
+            "Diagnostics/no_cmd_double_flight_rate",
+            "Diagnostics/planner_xy_err_ema",
+            "Diagnostics/planner_touch_count_step",
+            "Diagnostics/planner_hit8_ema",
+            "Diagnostics/planner_hit4_ema",
+            "Diagnostics/reset_rate_step",
+            "Diagnostics/reset_no_cmd_share_step",
+            "Diagnostics/reset_move_cmd_share_step",
+            "Diagnostics/reset_episode_len_no_cmd_ema",
+            "Diagnostics/reset_episode_len_move_cmd_ema",
+            "Diagnostics/reset_reason_contact_share_cum",
+            "Diagnostics/reset_reason_pose_share_cum",
+            "Diagnostics/reset_reason_timeout_share_cum",
+        ]
         # Play 手动控制模式：开启后，环境不再覆盖外部下发的速度/角速度指令
         manual_cmd_override = False
+        # Play/Test 模式下，reset 后是否允许自动随机重采样命令
+        allow_test_resample = False
+        # 姿态终止阈值（弧度）：与上游逻辑对齐
+        terminate_pitch = 1.0
+        terminate_roll = 0.8
+        terminate_pose_consecutive_steps = 1
+        terminate_contact_force = 2.0
+        terminate_contact_consecutive_steps = 2
         # num_observations = 47 + 160
         # num_privileged_obs = 50 + 160
-        num_observations = 790#本体感受(50)*3帧历史 + 视觉特征(640) = 790
-        num_privileged_obs = 980#学生(790) + 局部高度采样(187) + 物理参数(3) = 980
+        num_observations = 798#本体感受历史(150) + planner对齐特征(8) + 视觉特征(640)
+        num_privileged_obs = 988#学生(798) + 局部高度采样(187) + 物理参数(3) = 988
         
 
     # [恢复] 地形配置 (这对视觉训练很重要)
@@ -140,22 +219,22 @@ class G1RoughCfg( LeggedRobotCfg ):
         terrain_length = 8.
         terrain_width = 8.
         # 后期课程从更高等级才开始生效，避免“学会走之前就进严格评分”
-        late_stage_start_level = 5.0
-        late_stage_progress_pow = 1.6
+        late_stage_start_level = 7.0
+        late_stage_progress_pow = 2.2
         # 升级距离阈值：保持严格标准，要求接近完成一段完整上坡推进
-        curriculum_move_up_distance = 3.5
+        curriculum_move_up_distance = 4.5
         # 升级还需满足 final_distance > move_up_distance * ratio（抗推搡误升）
-        curriculum_move_up_final_ratio = 0.60
+        curriculum_move_up_final_ratio = 0.76
         # 降级距离阈值（终点位移）
         curriculum_move_down_distance = 1.0
         # 降级还需满足 max_distance < move_up_distance * ratio（防“有推进却回摆”误降）
         curriculum_move_down_max_ratio = 0.55
-        # 升级还需满足回合内“楼梯暴露占比”达到阈值，减少“平地走远就升级”
-        curriculum_move_up_stair_conf = 0.10
+        # 当前为纯楼梯金字塔地形，先关闭 stair_conf 升级门控，简化课程判据
+        curriculum_move_up_stair_conf = 0.0
         # 峰值兜底阈值
-        curriculum_move_up_stair_conf_peak = 0.40
+        curriculum_move_up_stair_conf_peak = 0.52
         # 最少导航步数，避免偶发短时暴露触发误升
-        curriculum_move_up_nav_steps_min = 28
+        curriculum_move_up_nav_steps_min = 56
         num_rows= 10 
         num_cols = 20 
         # num_rows= 5 
@@ -171,10 +250,12 @@ class G1RoughCfg( LeggedRobotCfg ):
         added_mass_range = [-1., 3.]
         push_robots = True
         push_interval_s = 8
+        # 重置后先给若干稳定时间，避免“无指令静止样本”被即时推搡污染
+        push_warmup_s = 1.0
         max_push_vel_xy = 0.5
         # 推搡课程化：前期几乎无推搡，后期逐步拉起
         push_curriculum = True
-        push_start_progress = 0.45
+        push_start_progress = 0.85
         push_min_scale = 0.0
 
     class control( LeggedRobotCfg.control ):
@@ -226,12 +307,16 @@ class G1RoughCfg( LeggedRobotCfg ):
         only_positive_rewards = False
         # 探索样本任务降权系数（1.0=不降权，0.0=完全屏蔽）
         explore_task_weight = 0.30
+        # 全贴合判定阈值：脚角点离地超过该高度视为悬空（米）
+        full_contact_edge_threshold = 0.01
         
         class scales( LeggedRobotCfg.rewards.scales ):
             # --- 基础运动奖励 ---
             tracking_lin_vel = 1.2
+            # 显式惩罚摔倒终止，避免“猛冲几步后前扑”成为局部最优
+            termination = -5.0
             # 轻保底，避免“活着就有高分”掩盖主任务
-            alive = 0.08
+            alive = 0.03
             # 关闭：与 stair_clearance 目标高度引导重叠，容易形成抬腿刷分
             feet_air_time = 0.0
             # [正向] 在非楼梯区鼓励“朝向台阶并持续前进”（实际强度由课程进一步调度）
@@ -241,27 +326,27 @@ class G1RoughCfg( LeggedRobotCfg ):
             dof_acc = -1.5e-7           # [负向] 惩罚关节加速度过大 (省电、平滑)
             # 抑制“无指令漂移”和“有指令怠工”
             stand_still = -0.12
-            # ================= 楼梯专项惩罚 (必须为负数!) =================
+            # ================= 楼梯专项（含奖励与惩罚） =================
             # 4. 惩罚摆动腿离地高度偏离目标值 (0.08m)
             # feet_swing_height = -1.5             
             # 7. 惩罚髋关节劈叉或奇怪的姿势
             # 小权重保留：约束髋部姿态漂移，但不过度压制上台阶代偿
             hip_pos = -0.2
             # 8. 惩罚脚落地后还在滑动 (打滑惩罚)
-            # 关闭：与 rect/clearance/contact 等形成重复约束，易抑制落脚后微调
-            contact_no_vel = 0.0
+            # 小权重保留：用于稳住零指令站立，不与 rect/clearance 主约束抢权重
+            contact_no_vel = -0.04
 
             dof_pos_limits = -3.0
             #######################
             orientation = -0.3#-0.5          # [负向] 惩罚基座倾斜
             # 1. 惩罚脚掌与地面不平行 (专治脚尖绷直、蝎子摆尾)
-            # 关闭：与 foot_support_rect 目标重叠，先释放探索空间
-            foot_flatness = 0.0
+            # 小权重保留：强化“全脚掌贴合”，特别是静止与落足末段
+            foot_flatness = -0.10
             
             pelvis_height = 0.10
 
             # 视觉对齐惩罚：提高权重，抑制“看见台阶仍绕圈”
-            vision_stair_drive = -0.45
+            stair_alignment = -0.45
 
 
             # tracking_ang_vel = 2.0
@@ -278,10 +363,13 @@ class G1RoughCfg( LeggedRobotCfg ):
             first_step_commit = 0.4
             lin_vel_z = -0.45           # [负向] 抑制双脚同跳/过大起伏
             action_rate = -0.02         # [负向] 进一步抑制抖动和碎步
-            foot_support_rect = -0.35   #-2.0
+            # 台阶内安全落脚奖励：函数内部已含负惩罚分支，因此权重为正
+            foot_support_rect = 0.35
             stair_clearance = 0.24
             feet_stumble = -1.0
             stair_alternation = 0.45
+            # Planner 跟踪（XY-only）：约束实际落足贴合规划落点；Z 由 clearance 负责
+            planner_tracking = 0.20
             
             # 权重给到 1.0，强力纠正它侧着身子蹭台阶的坏习惯
             # stair_alignment = -0.5
@@ -296,7 +384,7 @@ class G1RoughCfg( LeggedRobotCfg ):
 
             # --- 新增：导航引导 ( carrot 诱饵 ) ---
             # 权重给到 1.5，让它与前向速度奖励(2.0)叠加，产生巨大的“吸力”
-            # vision_stair_drive = 1.5   
+            # stair_alignment = 1.5   
             
             # 权重给到 1.0，强力纠正它侧着身子蹭台阶的坏习惯
             # stair_alignment = 1.0
@@ -363,13 +451,13 @@ class G1RoughCfgPPO( LeggedRobotCfgPPO ):
         # rnn_num_layers = 1
         
     class algorithm( LeggedRobotCfgPPO.algorithm ):
-        learning_rate = 5e-4#5e-4      # 从 1e-3 降到 5e-4
+        learning_rate = 3e-4#5e-4      # 从 1e-3 降到 5e-4
         num_mini_batches = 4#8  # 增加分块以稳定显存和梯度
         entropy_coef = 0.01#0.02#0.01       # 从 0.01 提到 0.02，防止过早收敛到小碎步策略
         # entropy_coef = 0.01
     class runner( LeggedRobotCfgPPO.runner ):
         policy_class_name = "ActorCriticTS"
-        max_iterations = 5000
+        max_iterations = 8000
         #num_steps_per_env没有编辑，默认为24
         num_steps_per_env = 64
         run_name = "TS_S_Climbing"

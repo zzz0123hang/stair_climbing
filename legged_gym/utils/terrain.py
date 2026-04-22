@@ -116,13 +116,30 @@ class Terrain:
         self.stair_edge_raw_threshold = raw_thr
         self.stair_edge_height_threshold = raw_thr * vertical_scale
     
+    def _resolve_stair_step_height(self, difficulty, row_idx=None):
+        """
+        Resolve stair step height.
+        Priority:
+        1) cfg.stair_height_levels (explicit row-wise height list, meters)
+        2) default curriculum mapping: 0.05 + 0.1 * difficulty
+        """
+        levels = getattr(self.cfg, "stair_height_levels", None)
+        if levels is not None and len(levels) > 0:
+            levels_np = np.asarray(levels, dtype=np.float32).reshape(-1)
+            if row_idx is not None:
+                idx = int(np.clip(row_idx, 0, len(levels_np) - 1))
+            else:
+                idx = int(np.clip(np.round(difficulty * (len(levels_np) - 1)), 0, len(levels_np) - 1))
+            return float(levels_np[idx])
+        return 0.05 + 0.1 * difficulty
+
     def randomized_terrain(self):
         for k in range(self.cfg.num_sub_terrains):
             # Env coordinates in the world
             (i, j) = np.unravel_index(k, (self.cfg.num_rows, self.cfg.num_cols))
             choice = np.random.uniform(0, 1)
             difficulty = np.random.choice([0.5, 0.75, 0.9])
-            terrain = self.make_terrain(choice, difficulty)
+            terrain = self.make_terrain(choice, difficulty, row_idx=i)
             self.add_terrain_to_map(terrain, i, j)
         
     def curiculum(self):
@@ -131,7 +148,7 @@ class Terrain:
                 difficulty = i / self.cfg.num_rows
                 choice = j / self.cfg.num_cols + 0.001
 
-                terrain = self.make_terrain(choice, difficulty)
+                terrain = self.make_terrain(choice, difficulty, row_idx=i)
                 self.add_terrain_to_map(terrain, i, j)
 
     def selected_terrain(self):
@@ -149,14 +166,14 @@ class Terrain:
             eval(terrain_type)(terrain, **self.cfg.terrain_kwargs.terrain_kwargs)
             self.add_terrain_to_map(terrain, i, j)
     
-    def make_terrain(self, choice, difficulty):
+    def make_terrain(self, choice, difficulty, row_idx=None):
         terrain = terrain_utils.SubTerrain(   "terrain",
                                 width=self.width_per_env_pixels,
                                 length=self.width_per_env_pixels,
                                 vertical_scale=self.cfg.vertical_scale,
                                 horizontal_scale=self.cfg.horizontal_scale)
         slope = difficulty * 0.4
-        step_height = 0.05 + 0.1 * difficulty
+        step_height = self._resolve_stair_step_height(difficulty, row_idx=row_idx)
         # step_height = 0.12
         discrete_obstacles_height = 0.05 + difficulty * 0.2
         stepping_stones_size = 1.5 * (1.05 - difficulty)
