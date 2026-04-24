@@ -415,12 +415,6 @@ class G1Robot(LeggedRobot):
         self.foothold_plan_new_event = torch.zeros((self.num_envs, self.feet_num), dtype=torch.bool, device=self.device)
         self.foothold_prev_swing_mask = torch.zeros((self.num_envs, self.feet_num), dtype=torch.bool, device=self.device)
         self.foothold_plan_prev_contact = torch.zeros((self.num_envs, self.feet_num), dtype=torch.bool, device=self.device)
-        self.foothold_plan_contact_hold_steps = torch.zeros((self.num_envs, self.feet_num), dtype=torch.long, device=self.device)
-        # 支撑脚触地锁存：用于下一次对侧摆动预测的稳定参考。
-        self.foothold_support_latch_xy = torch.zeros((self.num_envs, self.feet_num, 2), dtype=torch.float, device=self.device)
-        self.foothold_support_latch_z = torch.zeros((self.num_envs, self.feet_num), dtype=torch.float, device=self.device)
-        self.foothold_support_latch_h = torch.zeros((self.num_envs, self.feet_num), dtype=torch.float, device=self.device)
-        self.foothold_support_latch_valid = torch.zeros((self.num_envs, self.feet_num), dtype=torch.bool, device=self.device)
         self.alt_prev_contact_feet = torch.zeros((self.num_envs, self.feet_num), dtype=torch.bool, device=self.device)
         # Planner 跟踪奖励事件缓存（与 alternation 解耦）
         self.plan_track_prev_contact = torch.zeros((self.num_envs, self.feet_num), dtype=torch.bool, device=self.device)
@@ -1020,56 +1014,9 @@ class G1Robot(LeggedRobot):
         )
 
         swing_start = 0.55
-        support_hold_frames = 2
         contact_now = self.contact_forces[:, self.feet_indices, 2] > 1.2
         if not hasattr(self, "foothold_plan_prev_contact"):
             self.foothold_plan_prev_contact = contact_now.clone()
-        if not hasattr(self, "foothold_plan_contact_hold_steps"):
-            self.foothold_plan_contact_hold_steps = torch.zeros(
-                (self.num_envs, self.feet_num), dtype=torch.long, device=self.device
-            )
-        if not hasattr(self, "foothold_support_latch_xy"):
-            self.foothold_support_latch_xy = torch.zeros(
-                (self.num_envs, self.feet_num, 2), dtype=torch.float, device=self.device
-            )
-        if not hasattr(self, "foothold_support_latch_z"):
-            self.foothold_support_latch_z = torch.zeros(
-                (self.num_envs, self.feet_num), dtype=torch.float, device=self.device
-            )
-        if not hasattr(self, "foothold_support_latch_h"):
-            self.foothold_support_latch_h = torch.zeros(
-                (self.num_envs, self.feet_num), dtype=torch.float, device=self.device
-            )
-        if not hasattr(self, "foothold_support_latch_valid"):
-            self.foothold_support_latch_valid = torch.zeros(
-                (self.num_envs, self.feet_num), dtype=torch.bool, device=self.device
-            )
-        self.foothold_plan_contact_hold_steps = torch.where(
-            contact_now,
-            self.foothold_plan_contact_hold_steps + 1,
-            torch.zeros_like(self.foothold_plan_contact_hold_steps),
-        )
-        stable_touchdown_event = contact_now & (self.foothold_plan_contact_hold_steps == support_hold_frames)
-        if stable_touchdown_event.any():
-            self.foothold_support_latch_xy = torch.where(
-                stable_touchdown_event.unsqueeze(-1),
-                self.feet_pos[:, :, :2],
-                self.foothold_support_latch_xy,
-            )
-            self.foothold_support_latch_z = torch.where(
-                stable_touchdown_event,
-                self.feet_pos[:, :, 2],
-                self.foothold_support_latch_z,
-            )
-            touchdown_env_ids = torch.where(torch.any(stable_touchdown_event, dim=1))[0]
-            if touchdown_env_ids.numel() > 0:
-                top_h_touch = self._get_feet_corner_top_heights(env_ids=touchdown_env_ids)
-                self.foothold_support_latch_h[touchdown_env_ids] = torch.where(
-                    stable_touchdown_event[touchdown_env_ids],
-                    top_h_touch,
-                    self.foothold_support_latch_h[touchdown_env_ids],
-                )
-            self.foothold_support_latch_valid = self.foothold_support_latch_valid | stable_touchdown_event
         liftoff_event = (~contact_now) & self.foothold_plan_prev_contact
 
         cmd_planar_all = torch.norm(self.commands[:, :2], dim=1)
@@ -1095,8 +1042,8 @@ class G1Robot(LeggedRobot):
             self.foothold_plan_ttl_steps,
             torch.zeros_like(self.foothold_plan_ttl_steps),
         )
-        # 脚连续踩稳后，关闭该脚的激活标记（完成一次摆动闭环）。
-        touchdown_stable = contact_now & (self.foothold_plan_contact_hold_steps >= support_hold_frames)
+        # 脚触地后即关闭该脚激活标记（完成一次摆动闭环），不再依赖 hold/latch。
+        touchdown_stable = contact_now
         self.foothold_plan_active = torch.where(
             touchdown_stable,
             torch.zeros_like(self.foothold_plan_active),
@@ -1108,10 +1055,10 @@ class G1Robot(LeggedRobot):
             self.foothold_plan_ttl_steps,
         )
 
-        # 离地即预测（仅保留任务门控），不再因 support_ready 直接跳过。
-        enter_swing = liftoff_event & planner_task_env.unsqueeze(1)
+        # 离地即预测：只要“支撑->摆动”切换就更新本次目标，不再依赖 hold/latch。
+        enter_swing = liftoff_event
 
-        swing_now = (~contact_now) & planner_task_env.unsqueeze(1)
+        swing_now = ~contact_now
         self.foothold_prev_swing_mask = swing_now.clone()
 
         if not enter_swing.any():
@@ -1178,16 +1125,8 @@ class G1Robot(LeggedRobot):
             # 摆动脚高度改为四角最高值：
             # 预测只在离地切换瞬间触发，直接用最高点更符合“当前所处台阶级”。
             swing_h = top_h[:, swing_foot]
-            support_valid = torch.zeros(len(env_ids), dtype=torch.bool, device=self.device)
-            if hasattr(self, "foothold_support_latch_valid"):
-                support_valid = self.foothold_support_latch_valid[env_ids, support_foot]
+            # 去掉 latch：直接使用“当前另一条腿”四角最高点作为台阶等级基准。
             support_h = support_h_now
-            if hasattr(self, "foothold_support_latch_h"):
-                support_h = torch.where(
-                    support_valid,
-                    self.foothold_support_latch_h[env_ids, support_foot],
-                    support_h_now,
-                )
             step_h = torch.clamp(self._get_step_height_target(env_ids=env_ids), min=0.05, max=0.20)
             level_diff_signed = support_h - swing_h
             same_level_thr = torch.clamp(0.30 * step_h, min=0.022, max=0.055)
@@ -1266,20 +1205,21 @@ class G1Robot(LeggedRobot):
                     return has_edge_local, best_axis
 
                 # 规则化目标：
-                # - 默认目标 = 对侧脚“上一级台阶”边缘 + 9cm；
-                # - 找不到上一级边缘（如最高台阶）=> 对侧脚同级台阶 + 9cm。
+                # - 台阶级别/边缘来源：对侧脚；
+                # - 目标点落在当前摆动脚的“本脚横向通道”上，避免左右脚目标互相串道；
+                # - 找不到上一级边缘（如最高台阶）=> 回退到“对侧脚当前等级”并投影到摆动脚通道，再 +9cm。
                 support_anchor_xy = self.feet_pos[env_ids, support_foot, :2]
-                if hasattr(self, "foothold_support_latch_xy"):
-                    support_anchor_xy = torch.where(
-                        support_valid.unsqueeze(1),
-                        self.foothold_support_latch_xy[env_ids, support_foot],
-                        support_anchor_xy,
-                    )
                 has_support_up_edge, support_up_edge_axis = _lookup_front_edge_axis(support_anchor_xy)
-                support_up_edge_xy = support_anchor_xy.clone()
-                support_up_edge_xy[:, 0] = torch.where(use_x_axis, support_up_edge_axis, support_up_edge_xy[:, 0])
-                support_up_edge_xy[:, 1] = torch.where(~use_x_axis, support_up_edge_axis, support_up_edge_xy[:, 1])
-                edge_xy = torch.where(has_support_up_edge.unsqueeze(1), support_up_edge_xy, support_anchor_xy)
+                # 关键修复：边缘轴向值来自支撑脚，但横向坐标保持摆动脚通道，防止可视化“交叉落点”。
+                swing_lane_xy = start_xy.clone()
+                swing_lane_edge_xy = swing_lane_xy.clone()
+                swing_lane_edge_xy[:, 0] = torch.where(use_x_axis, support_up_edge_axis, swing_lane_edge_xy[:, 0])
+                swing_lane_edge_xy[:, 1] = torch.where(~use_x_axis, support_up_edge_axis, swing_lane_edge_xy[:, 1])
+                support_same_level_axis = torch.where(use_x_axis, support_anchor_xy[:, 0], support_anchor_xy[:, 1])
+                swing_lane_same_level_xy = swing_lane_xy.clone()
+                swing_lane_same_level_xy[:, 0] = torch.where(use_x_axis, support_same_level_axis, swing_lane_same_level_xy[:, 0])
+                swing_lane_same_level_xy[:, 1] = torch.where(~use_x_axis, support_same_level_axis, swing_lane_same_level_xy[:, 1])
+                edge_xy = torch.where(has_support_up_edge.unsqueeze(1), swing_lane_edge_xy, swing_lane_same_level_xy)
                 has_exact = has_support_up_edge
                 edge_count = torch.where(
                     has_support_up_edge,
@@ -1312,8 +1252,7 @@ class G1Robot(LeggedRobot):
             depth = torch.clamp(torch.full((len(env_ids),), target_depth, device=self.device), min=depth_min, max=depth_max)
             anchor_xy = edge_xy + dir_unit * depth.unsqueeze(1)
 
-            # 仅在达到期望跨级数时更新目标，且目标恒为“对应边缘 + 9cm”。
-            # 跨不到时不更新（沿用上一目标）。
+            # 目标恒为“对应边缘 + 9cm”。
             target_xy = anchor_xy
 
             target_z = self._get_terrain_heights(
@@ -1343,16 +1282,14 @@ class G1Robot(LeggedRobot):
 
             dz_goal = target_z - support_h
             support_z_ref = self.feet_pos[env_ids, support_foot, 2]
-            if hasattr(self, "foothold_support_latch_z"):
-                support_z_ref = torch.where(
-                    support_valid,
-                    self.foothold_support_latch_z[env_ids, support_foot],
-                    support_z_ref,
-                )
             dz_start = self.feet_pos[env_ids, swing_foot, 2] - support_z_ref
             no_edge_current = (~has_exact)
             top_out = no_edge_current & (desired_cross > 0)
-            conf = torch.where(has_exact, torch.full_like(target_z, 0.95), torch.full_like(target_z, 0.72))
+            conf_raw = torch.where(has_exact, torch.full_like(target_z, 0.95), torch.full_like(target_z, 0.72))
+            task_env_local = planner_task_env[env_ids]
+            edge_count_final = torch.where(task_env_local, edge_count_final, torch.zeros_like(edge_count_final))
+            conf = torch.where(task_env_local, conf_raw, torch.zeros_like(conf_raw))
+            top_out = top_out & task_env_local
 
             # 这版按事件“直接写入当次规划结果”，避免旧目标残留干扰当前步态。
             self.foothold_plan_target_xy[env_ids, swing_foot] = target_xy
@@ -1365,9 +1302,14 @@ class G1Robot(LeggedRobot):
             self.foothold_plan_dz_start[env_ids, swing_foot] = dz_start
             self.foothold_plan_conf[env_ids, swing_foot] = conf
             self.foothold_plan_top_out[env_ids, swing_foot] = top_out
-            self.foothold_plan_new_event[env_ids, swing_foot] = True
-            self.foothold_plan_active[env_ids, swing_foot] = True
-            self.foothold_plan_ttl_steps[env_ids, swing_foot] = swing_ttl_steps
+            self.foothold_plan_new_event[env_ids, swing_foot] = task_env_local
+            self.foothold_plan_active[env_ids, swing_foot] = task_env_local
+            ttl_vals = torch.where(
+                task_env_local,
+                torch.full((len(env_ids),), swing_ttl_steps, dtype=torch.long, device=self.device),
+                torch.zeros((len(env_ids),), dtype=torch.long, device=self.device),
+            )
+            self.foothold_plan_ttl_steps[env_ids, swing_foot] = ttl_vals
 
         self.foothold_plan_active = self.foothold_plan_active & (self.foothold_plan_ttl_steps > 0)
 
@@ -3082,16 +3024,6 @@ class G1Robot(LeggedRobot):
             self.foothold_prev_swing_mask[env_ids] = False
         if hasattr(self, "foothold_plan_prev_contact"):
             self.foothold_plan_prev_contact[env_ids] = False
-        if hasattr(self, "foothold_plan_contact_hold_steps"):
-            self.foothold_plan_contact_hold_steps[env_ids] = 0
-        if hasattr(self, "foothold_support_latch_xy"):
-            self.foothold_support_latch_xy[env_ids] = 0.0
-        if hasattr(self, "foothold_support_latch_z"):
-            self.foothold_support_latch_z[env_ids] = 0.0
-        if hasattr(self, "foothold_support_latch_h"):
-            self.foothold_support_latch_h[env_ids] = 0.0
-        if hasattr(self, "foothold_support_latch_valid"):
-            self.foothold_support_latch_valid[env_ids] = False
         if hasattr(self, "alt_prev_contact_feet"):
             self.alt_prev_contact_feet[env_ids] = False
         if hasattr(self, "alt_prev_lead_sign"):
