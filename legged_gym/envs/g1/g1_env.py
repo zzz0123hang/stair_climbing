@@ -373,8 +373,6 @@ class G1Robot(LeggedRobot):
         self._stair_corner_conf_cache = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
         self._stair_grad_dir_cache = torch.zeros((self.num_envs, 2), dtype=torch.float, device=self.device)
         self._stair_axis_cache_step = -1
-        # 零指令锁存（单位：仿真步），用于形成连续静止片段
-        self.no_cmd_hold_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         # 相位状态机（RUN/SETTLING/HOLD）：
         # - RUN: 有运动意图时按命令驱动步频推进
         # - SETTLING: 收敛到双支撑后再进入 HOLD，避免“摆动中途硬冻结”
@@ -390,6 +388,8 @@ class G1Robot(LeggedRobot):
         self.phase_resume_ramp = torch.ones(self.num_envs, dtype=torch.float, device=self.device)
         # 诊断 EMA（用于课程权重闭环，不直接参与动力学）
         self.no_cmd_instability_ema = torch.zeros(1, dtype=torch.float, device=self.device)
+        # no_cmd 比例控制 EMA：用于降低重采样时的高频抖动，避免比例控制过冲
+        self.no_cmd_rate_ema = torch.zeros(1, dtype=torch.float, device=self.device)
         self.planner_xy_err_ema = torch.zeros(1, dtype=torch.float, device=self.device)
         self.planner_hit8_ema = torch.zeros(1, dtype=torch.float, device=self.device)
         self.planner_hit4_ema = torch.zeros(1, dtype=torch.float, device=self.device)
@@ -829,15 +829,13 @@ class G1Robot(LeggedRobot):
         return progress_vel, v_axis, v_lat, axis_mix, stair_conf, axis_reliable, corner_conf
 
     def _get_no_cmd_mask(self, planar_thr=None, yaw_thr=None):
-        """统一零指令判据：平面速度命令与偏航命令都接近 0（含 hold 锁存）。"""
+        """统一零指令判据：平面速度命令与偏航命令都接近 0。"""
         if planar_thr is None:
             planar_thr = float(getattr(self.cfg.commands, "no_cmd_planar_thr", 0.05))
         if yaw_thr is None:
             yaw_thr = float(getattr(self.cfg.commands, "no_cmd_yaw_thr", 0.05))
         cmd_planar = torch.norm(self.commands[:, :2], dim=1)
         no_cmd = (cmd_planar < planar_thr) & (torch.abs(self.commands[:, 2]) < yaw_thr)
-        if hasattr(self, "no_cmd_hold_steps"):
-            no_cmd = no_cmd | (self.no_cmd_hold_steps > 0)
         return no_cmd
 
     def _compute_pose_conditioned_depth_strips(self, depth_img: torch.Tensor):
@@ -1152,10 +1150,24 @@ class G1Robot(LeggedRobot):
             vel_dir = torch.where(vel_dir_norm > 1e-5, vel_dir_mix / (vel_dir_norm + 1e-6), body_fwd)
             step = float(self.cfg.terrain.horizontal_scale)
             border = float(self.cfg.terrain.border_size)
-            use_x_axis = torch.abs(vel_dir[:, 0]) >= torch.abs(vel_dir[:, 1])
-            axis_sign = torch.where(use_x_axis, torch.sign(vel_dir[:, 0]), torch.sign(vel_dir[:, 1]))
+            # 规划方向改为“台阶边缘法线方向”，避免速度方向漂移导致落点斜切。
+            if hasattr(self, "height_grad_x_map") and hasattr(self, "height_grad_y_map"):
+                stair_axis_all, _, _, grad_dir_all = self._estimate_stair_axis_state()
+                stair_axis = stair_axis_all[env_ids]
+                grad_dir = grad_dir_all[env_ids]
+            else:
+                stair_axis = torch.zeros_like(body_fwd)
+                stair_axis[:, 0] = 1.0
+                grad_dir = stair_axis.clone()
+            use_x_axis = stair_axis[:, 0] >= stair_axis[:, 1]
+            grad_axis_proj = torch.sum(grad_dir * stair_axis, dim=1)
+            cmd_axis_proj = torch.sum(self.commands[env_ids, :2] * stair_axis, dim=1)
+            body_axis_proj = torch.sum(body_fwd * stair_axis, dim=1)
+            axis_sign_hint = torch.where(torch.abs(cmd_axis_proj) > 0.03, cmd_axis_proj, body_axis_proj)
+            axis_sign_raw = torch.where(torch.abs(grad_axis_proj) > 0.02, grad_axis_proj, axis_sign_hint)
+            axis_sign = torch.sign(axis_sign_raw)
             axis_sign = torch.where(torch.abs(axis_sign) < 1e-5, torch.ones_like(axis_sign), axis_sign)
-            start_axis = torch.where(use_x_axis, start_xy[:, 0], start_xy[:, 1])
+            dir_unit = stair_axis * axis_sign.unsqueeze(1)
 
             # 以四角最高 z 估计台阶级差：
             # - 同级(含死区)：level_gap = 0 -> 跨 1 级
@@ -1212,18 +1224,7 @@ class G1Robot(LeggedRobot):
             probe_floor = torch.where(desired_cross <= 1, single_cross_floor, probe_floor_default)
             probe_floor = torch.clamp(probe_floor, min=0.30, max=0.78)
             probe_dist = torch.maximum(virtual_speed * swing_duration, probe_floor)
-            raw_target_xy = start_xy + vel_dir * probe_dist.unsqueeze(1)
-            # XY 参考只在“对侧当前接触”时使用对侧脚当前坐标；
-            # 对侧不接触（双摆）时，退回纯速度前探（start_xy + v_dir * dist）。
-            if self.feet_num >= 2:
-                opp_contact_now = contact_now[env_ids, support_foot]
-                support_anchor_xy = self.feet_pos[env_ids, support_foot, :2]
-                support_based_target_xy = support_anchor_xy + vel_dir * probe_dist.unsqueeze(1)
-                raw_target_xy = torch.where(
-                    opp_contact_now.unsqueeze(1),
-                    0.75 * raw_target_xy + 0.25 * support_based_target_xy,
-                    raw_target_xy,
-                )
+            raw_target_xy = start_xy + dir_unit * probe_dist.unsqueeze(1)
 
             # 与 rect 统一：优先使用“预计算台阶边缘查表”来做跨边计数与边缘定位
             if getattr(self, "has_stair_edge_lookup", False):
@@ -1232,10 +1233,6 @@ class G1Robot(LeggedRobot):
                     self.rect_lateral_offsets = torch.tensor([-1, 0, 1], device=self.device, dtype=torch.long)
                 lat_offsets = self.rect_lateral_offsets
                 k = int(lat_offsets.numel())
-                raw_axis = torch.where(use_x_axis, raw_target_xy[:, 0], raw_target_xy[:, 1])
-                search_span = torch.clamp(axis_sign * (raw_axis - start_axis), min=0.0, max=1.2)
-                search_span_axis = search_span + 0.5 * step
-
                 def _lookup_front_edge_axis(sample_xy):
                     sample_axis = torch.where(use_x_axis, sample_xy[:, 0], sample_xy[:, 1])
                     x_idx = torch.clamp(torch.floor((sample_xy[:, 0] + border) / step), 0, float(grid_rows - 1)).long()
@@ -1268,45 +1265,9 @@ class G1Robot(LeggedRobot):
                     best_axis = sample_axis + axis_sign * best_dist
                     return has_edge_local, best_axis
 
-                edge_count = torch.zeros(len(env_ids), dtype=torch.long, device=self.device)
-                has_any = torch.zeros(len(env_ids), dtype=torch.bool, device=self.device)
-                has_exact = torch.zeros(len(env_ids), dtype=torch.bool, device=self.device)
-                chosen_edge_axis = start_axis.clone()
-                last_edge_axis = start_axis.clone()
-                query_xy = start_xy.clone()
-
-                for _ in range(sample_num - 1):
-                    has_edge_k, edge_axis_k = _lookup_front_edge_axis(query_xy)
-                    within_span = has_edge_k & (axis_sign * (edge_axis_k - start_axis) <= search_span_axis)
-                    if not within_span.any():
-                        break
-                    edge_count = edge_count + within_span.long()
-                    has_any = has_any | within_span
-                    last_edge_axis = torch.where(within_span, edge_axis_k, last_edge_axis)
-                    exact_now = within_span & (~has_exact) & (edge_count == desired_cross)
-                    chosen_edge_axis = torch.where(exact_now, edge_axis_k, chosen_edge_axis)
-                    has_exact = has_exact | exact_now
-
-                    advance_axis = edge_axis_k + axis_sign * (0.6 * step)
-                    far_axis = start_axis + axis_sign * (search_span + step)
-                    next_axis = torch.where(within_span, advance_axis, far_axis)
-                    query_xy[:, 0] = torch.where(use_x_axis, next_axis, query_xy[:, 0])
-                    query_xy[:, 1] = torch.where(~use_x_axis, next_axis, query_xy[:, 1])
-
-                has_edge = has_any
-                edge_axis = torch.where(has_exact, chosen_edge_axis, last_edge_axis)
-                dir_norm = torch.norm(vel_dir, dim=1, keepdim=True)
-                dir_unit = torch.where(dir_norm > 1e-6, vel_dir / (dir_norm + 1e-6), body_fwd)
-                dir_axis_abs = torch.abs(torch.where(use_x_axis, dir_unit[:, 0], dir_unit[:, 1]))
-                dir_axis_abs = torch.clamp(dir_axis_abs, min=0.20)
-                edge_s = axis_sign * (edge_axis - start_axis) / dir_axis_abs
-                edge_s = torch.clamp(edge_s, min=0.0)
-                edge_s = torch.minimum(edge_s, probe_dist + 0.25)
-                edge_xy = start_xy + dir_unit * edge_s.unsqueeze(1)
-
-                # 规则化目标（按你的要求）：
+                # 规则化目标：
                 # - 默认目标 = 对侧脚“上一级台阶”边缘 + 9cm；
-                # - 找不到上一级边缘（如最高台阶）=> 回退为“对侧脚同级台阶”+ 9cm。
+                # - 找不到上一级边缘（如最高台阶）=> 对侧脚同级台阶 + 9cm。
                 support_anchor_xy = self.feet_pos[env_ids, support_foot, :2]
                 if hasattr(self, "foothold_support_latch_xy"):
                     support_anchor_xy = torch.where(
@@ -1315,18 +1276,16 @@ class G1Robot(LeggedRobot):
                         support_anchor_xy,
                     )
                 has_support_up_edge, support_up_edge_axis = _lookup_front_edge_axis(support_anchor_xy)
-                # 按你的要求：从“支撑切摆动脚”的离地点 start_xy 出发，
-                # 沿基座速度方向延伸到“对侧支撑脚上一级边缘”再 +9cm。
-                support_up_edge_s = axis_sign * (support_up_edge_axis - start_axis) / dir_axis_abs
-                support_up_edge_s = torch.clamp(support_up_edge_s, min=0.0)
-                support_up_edge_s = torch.minimum(support_up_edge_s, probe_dist + 0.45)
-                support_up_edge_xy = start_xy + dir_unit * support_up_edge_s.unsqueeze(1)
-
-                # 找不到上一级边缘时，回到对侧脚所在台阶（对应最高级台阶）作为目标边缘参考。
+                support_up_edge_xy = support_anchor_xy.clone()
+                support_up_edge_xy[:, 0] = torch.where(use_x_axis, support_up_edge_axis, support_up_edge_xy[:, 0])
+                support_up_edge_xy[:, 1] = torch.where(~use_x_axis, support_up_edge_axis, support_up_edge_xy[:, 1])
                 edge_xy = torch.where(has_support_up_edge.unsqueeze(1), support_up_edge_xy, support_anchor_xy)
-                has_edge = has_support_up_edge
                 has_exact = has_support_up_edge
-                edge_count = torch.where(has_support_up_edge, desired_cross, torch.zeros_like(desired_cross))
+                edge_count = torch.where(
+                    has_support_up_edge,
+                    torch.ones_like(desired_cross),
+                    torch.zeros_like(desired_cross)
+                )
             else:
                 # 兜底：无查表时退回旧版“连线高度差判边缘”
                 line_pts = start_xy.unsqueeze(1) + (raw_target_xy - start_xy).unsqueeze(1) * alphas.view(1, sample_num, 1)
@@ -1339,8 +1298,6 @@ class G1Robot(LeggedRobot):
                 dh = line_h[:, 1:] - line_h[:, :-1]
                 edge_mask = dh > edge_h_thr
                 edge_count = edge_mask.sum(dim=1)
-                has_edge = edge_count > 0
-
                 edge_cumsum = torch.cumsum(edge_mask.int(), dim=1)
                 desired_exact = edge_mask & (edge_cumsum == desired_cross.unsqueeze(1))
                 has_exact = desired_exact.any(dim=1)
@@ -1352,8 +1309,6 @@ class G1Robot(LeggedRobot):
                 edge_xy = start_xy + (raw_target_xy - start_xy) * edge_alpha.unsqueeze(1)
 
             # rect 锚点修正：edge + 9cm（并夹到 rect 可行域）
-            dir_norm = torch.norm(vel_dir, dim=1, keepdim=True)
-            dir_unit = torch.where(dir_norm > 1e-6, vel_dir / (dir_norm + 1e-6), body_fwd)
             depth = torch.clamp(torch.full((len(env_ids),), target_depth, device=self.device), min=depth_min, max=depth_max)
             anchor_xy = edge_xy + dir_unit * depth.unsqueeze(1)
 
@@ -1652,49 +1607,6 @@ class G1Robot(LeggedRobot):
         manual_cmd_override = bool(getattr(self.cfg.env, "manual_cmd_override", False))
         self.update_feet_state()
         self._update_full_contact_rate_metric()
-        # 递减零指令锁存计数
-        if hasattr(self, "no_cmd_hold_steps"):
-            prev_hold_mask = self.no_cmd_hold_steps > 0
-            self.no_cmd_hold_steps = torch.clamp(self.no_cmd_hold_steps - 1, min=0)
-            # 锁存窗口内每步硬保持零命令，防止视觉/历史残留把“静止样本”污染成慢速转体
-            hold_mask = self.no_cmd_hold_steps > 0
-            if hold_mask.any():
-                self.commands[hold_mask, 0] = 0.0
-                self.commands[hold_mask, 1] = 0.0
-                if self.cfg.commands.heading_command:
-                    forward = quat_apply(self.base_quat[hold_mask], self.forward_vec[hold_mask])
-                    current_heading = torch.atan2(forward[:, 1], forward[:, 0])
-                    self.commands[hold_mask, 3] = current_heading
-                else:
-                    self.commands[hold_mask, 2] = 0.0
-            # hold 刚到期时，若命令仍落在 zero 阈值内，立即注入最小有效运动命令；
-            # 避免出现“non-hold 但仍是 zero 命令”的脏样本。
-            just_expired = prev_hold_mask & (~hold_mask)
-            if just_expired.any() and not (self.cfg.env.test and manual_cmd_override):
-                planar_thr = float(getattr(self.cfg.commands, "no_cmd_planar_thr", 0.05))
-                yaw_thr = float(getattr(self.cfg.commands, "no_cmd_yaw_thr", 0.05))
-                cmd_planar = torch.norm(self.commands[:, :2], dim=1)
-                yaw_abs = torch.abs(self.commands[:, 2])
-                stale_zero_mask = just_expired & (cmd_planar < planar_thr) & (yaw_abs < yaw_thr)
-                if stale_zero_mask.any():
-                    stale_ids = stale_zero_mask.nonzero(as_tuple=False).flatten()
-                    min_forward = max(planar_thr + 0.08, 0.14)
-                    max_forward = float(self.command_ranges["lin_vel_x"][1])
-                    max_forward = max(max_forward, min_forward)
-                    if max_forward <= min_forward + 1e-6:
-                        cmd_x = torch.full((stale_ids.numel(),), min_forward, dtype=torch.float, device=self.device)
-                    else:
-                        cmd_x = torch_rand_float(
-                            min_forward, max_forward, (stale_ids.numel(), 1), device=self.device
-                        ).squeeze(1)
-                    self.commands[stale_ids, 0] = cmd_x
-                    self.commands[stale_ids, 1] = 0.0
-                    if self.cfg.commands.heading_command:
-                        forward = quat_apply(self.base_quat[stale_ids], self.forward_vec[stale_ids])
-                        current_heading = torch.atan2(forward[:, 1], forward[:, 0])
-                        self.commands[stale_ids, 3] = current_heading
-                    else:
-                        self.commands[stale_ids, 2] = 0.0
         # 默认给角速度跟踪奖励一个“可用目标”，避免在无视觉帧时目标缺失
         if not hasattr(self, "visual_target_yaw_vel"):
             self.visual_target_yaw_vel = torch.zeros(self.num_envs, device=self.device)
@@ -1900,19 +1812,22 @@ class G1Robot(LeggedRobot):
                     self.commands[:, 2]
                 )
 
-        # no_cmd 环境每步硬归零：防止 near-zero 残留命令和历史 yaw 引起静止乱动
+        # no_cmd 控制：每步保持零命令，避免残留小命令把站立样本拉回慢速行走。
         if not (self.cfg.env.test and manual_cmd_override):
-            no_cmd_force_mask = self._get_no_cmd_mask()
-            if no_cmd_force_mask.any():
-                self.commands[no_cmd_force_mask, 0] = 0.0
-                self.commands[no_cmd_force_mask, 1] = 0.0
-                self.commands[no_cmd_force_mask, 2] = 0.0
+            no_cmd_mask = self._get_no_cmd_mask()
+            if no_cmd_mask.any():
+                self.commands[no_cmd_mask, 0] = 0.0
+                self.commands[no_cmd_mask, 1] = 0.0
                 if self.cfg.commands.heading_command:
-                    forward = quat_apply(self.base_quat[no_cmd_force_mask], self.forward_vec[no_cmd_force_mask])
+                    forward = quat_apply(self.base_quat[no_cmd_mask], self.forward_vec[no_cmd_mask])
                     current_heading = torch.atan2(forward[:, 1], forward[:, 0])
-                    self.commands[no_cmd_force_mask, 3] = current_heading
+                    self.commands[no_cmd_mask, 3] = current_heading
+                else:
+                    self.commands[no_cmd_mask, 2] = 0.0
+                if hasattr(self, "visual_target_yaw_vel"):
+                    self.visual_target_yaw_vel[no_cmd_mask] = 0.0
                 if hasattr(self, "yaw_track_target"):
-                    self.yaw_track_target[no_cmd_force_mask] = 0.0
+                    self.yaw_track_target[no_cmd_mask] = 0.0
 
         # 回合级楼梯暴露统计（供课程升级逻辑读取）
         if hasattr(self, "episode_stair_conf_sum"):
@@ -1946,12 +1861,8 @@ class G1Robot(LeggedRobot):
         self.extras["Diagnostics/no_cmd_single_support_rate"] = no_cmd_single_support_rate.item()
         self.extras["Diagnostics/no_cmd_double_flight_rate"] = no_cmd_double_flight_rate.item()
         self.extras["Diagnostics/no_cmd_yaw_rate_mean"] = no_cmd_yaw_rate_mean.item()
-        if hasattr(self, "no_cmd_hold_steps"):
-            self.extras["Diagnostics/no_cmd_hold_rate"] = torch.mean((self.no_cmd_hold_steps > 0).float()).item()
-            no_hold_mask = ~(self.no_cmd_hold_steps > 0)
-            self.extras["Diagnostics/no_cmd_non_hold_rate"] = torch.mean(
-                (no_cmd_mask_diag & no_hold_mask).float()
-            ).item()
+        self.extras["Diagnostics/env_test_flag"] = 1.0 if bool(getattr(self.cfg.env, "test", False)) else 0.0
+        self.extras["Diagnostics/allow_test_resample_flag"] = 1.0 if bool(getattr(self.cfg.env, "allow_test_resample", False)) else 0.0
         cmd_planar_diag = torch.norm(self.commands[:, :2], dim=1)
         self.extras["Diagnostics/cmd_planar_zero_rate"] = torch.mean((cmd_planar_diag < 0.05).float()).item()
         if hasattr(self, "no_cmd_instability_ema"):
@@ -2445,10 +2356,9 @@ class G1Robot(LeggedRobot):
     # 请放在 g1_env.py 的 G1Robot 类中
     def _resample_commands(self, env_ids):
         """
-        指令重采样与软牵引课程（含零指令连续片段锁存）：
+        指令重采样与软牵引课程：
         - 楼梯段：前进牵引 + 课程化零指令驻立样本；
-        - 平地段：前进牵引 + 少量零指令 + 探索样本；
-        - 零指令样本可跨多个重采样周期保持，稳定学习“无指令静止”。
+        - 平地段：前进牵引 + 少量零指令 + 探索样本。
         """
         # 注意：不在“普通指令重采样”中清 planner/latch 缓存。
         # 缓存只在 reset_idx 中按回合边界清理，避免中途重采样导致规划闭环断裂。
@@ -2467,120 +2377,52 @@ class G1Robot(LeggedRobot):
             if hasattr(self, "explore_cmd_mask"):
                 self.explore_cmd_mask[target_env_ids] = False
 
-        def _assign_no_cmd_hold(target_env_ids, hold_min_s=None, hold_max_s=None):
-            if (target_env_ids.numel() == 0) or (not hasattr(self, "no_cmd_hold_steps")):
-                return
-            if hold_min_s is None:
-                hold_min_s = float(getattr(self.cfg.commands, "no_cmd_hold_min_s", 3.5))
-            if hold_max_s is None:
-                hold_max_s = float(getattr(self.cfg.commands, "no_cmd_hold_max_s", 6.0))
-            hold_min_s = max(0.0, hold_min_s)
-            hold_max_s = max(hold_min_s, hold_max_s)
-            hold_min_steps = int(round(hold_min_s / max(self.dt, 1e-6)))
-            hold_max_steps = int(round(hold_max_s / max(self.dt, 1e-6)))
-            hold_min_steps = max(0, hold_min_steps)
-            hold_max_steps = max(hold_min_steps, hold_max_steps)
-            if hold_max_steps == hold_min_steps:
-                hold_steps = torch.full((target_env_ids.numel(),), hold_min_steps, dtype=torch.long, device=self.device)
-            else:
-                hold_steps = torch.randint(
-                    hold_min_steps,
-                    hold_max_steps + 1,
-                    (target_env_ids.numel(),),
-                    device=self.device,
-                    dtype=torch.long
-                )
-            self.no_cmd_hold_steps[target_env_ids] = hold_steps
-
-        def _apply_min_active_commands(target_env_ids):
-            """将环境从 accidental no_cmd 拉回到最小有效运动命令（不触发 no_cmd 判据）。"""
-            if target_env_ids.numel() == 0:
-                return
-            planar_thr = float(getattr(self.cfg.commands, "no_cmd_planar_thr", 0.05))
-            min_forward = max(planar_thr + 0.08, 0.14)
-            max_forward = float(self.command_ranges["lin_vel_x"][1])
-            max_forward = max(max_forward, min_forward)
-            if max_forward <= min_forward + 1e-6:
-                cmd_x = torch.full((target_env_ids.numel(),), min_forward, device=self.device, dtype=torch.float)
-            else:
-                cmd_x = torch_rand_float(
-                    min_forward, max_forward, (target_env_ids.numel(), 1), device=self.device
-                ).squeeze(1)
-            self.commands[target_env_ids, 0] = cmd_x
-            self.commands[target_env_ids, 1] = 0.0
-            if self.cfg.commands.heading_command:
-                forward = quat_apply(self.base_quat[target_env_ids], self.forward_vec[target_env_ids])
-                current_heading = torch.atan2(forward[:, 1], forward[:, 0])
-                self.commands[target_env_ids, 3] = current_heading
-            else:
-                self.commands[target_env_ids, 2] = 0.0
-            if hasattr(self, "no_cmd_hold_steps"):
-                self.no_cmd_hold_steps[target_env_ids] = 0
-            if hasattr(self, "explore_cmd_mask"):
-                self.explore_cmd_mask[target_env_ids] = False
-
         manual_cmd_override = bool(getattr(self.cfg.env, "manual_cmd_override", False))
         allow_test_resample = bool(getattr(self.cfg.env, "allow_test_resample", False))
         if self.cfg.env.test and (manual_cmd_override or (not allow_test_resample)):
             # Play/Test 默认不在 reset 时注入随机指令，避免“零指令场景偶发跳变”
             _apply_zero_commands(env_ids)
-            if hasattr(self, "no_cmd_hold_steps"):
-                self.no_cmd_hold_steps[env_ids] = 0
             return
 
-        # 零指令锁存：若该环境仍在锁存窗口内，本次重采样保持零指令
-        if hasattr(self, "no_cmd_hold_steps"):
-            hold_active = self.no_cmd_hold_steps[env_ids] > 0
-        else:
-            hold_active = torch.zeros(len(env_ids), dtype=torch.bool, device=self.device)
-        if hold_active.any():
-            hold_env_ids = env_ids[hold_active]
-            _apply_zero_commands(hold_env_ids)
-        work_env_ids = env_ids[~hold_active]
+        work_env_ids = env_ids
         if work_env_ids.numel() == 0:
             return
 
-        # no_cmd 硬配额 governor：直接约束“本次重采样后”的 no_cmd 环境数量，
-        # 避免仅靠概率缩放导致 no_cmd_rate 长期漂到 0.7+。
+        # no_cmd 软 governor：只调采样概率，不做按环境数的硬配额回收，
+        # 避免 no_cmd_rate 曲线出现“台阶/脉冲”。
         target_no_cmd = float(getattr(self.cfg.commands, "target_no_cmd_rate", 0.30))
         target_no_cmd_low = float(getattr(self.cfg.commands, "target_no_cmd_rate_low", 0.25))
         target_no_cmd_high = float(getattr(self.cfg.commands, "target_no_cmd_rate_high", 0.35))
-        target_no_cmd = min(max(target_no_cmd, target_no_cmd_low), target_no_cmd_high)
+        target_no_cmd = float(np.clip(target_no_cmd, target_no_cmd_low, target_no_cmd_high))
 
         if hasattr(self, "_get_no_cmd_mask"):
             try:
-                no_cmd_mask_all = self._get_no_cmd_mask()
-                no_cmd_rate_now = float(torch.mean(no_cmd_mask_all.float()).item())
+                no_cmd_rate_now = float(torch.mean(self._get_no_cmd_mask().float()).item())
             except TypeError:
-                no_cmd_mask_all = self._get_no_cmd_mask(planar_thr=0.05, yaw_thr=0.05)
-                no_cmd_rate_now = float(torch.mean(no_cmd_mask_all.float()).item())
+                no_cmd_rate_now = float(torch.mean(self._get_no_cmd_mask(planar_thr=0.05, yaw_thr=0.05).float()).item())
         else:
-            no_cmd_mask_all = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
             no_cmd_rate_now = 0.0
 
-        target_no_cmd_low_count = int(round(target_no_cmd_low * self.num_envs))
-        target_no_cmd_high_count = int(round(target_no_cmd_high * self.num_envs))
-        if no_cmd_rate_now > target_no_cmd_high:
-            desired_no_cmd_rate = target_no_cmd_low
-        elif no_cmd_rate_now < target_no_cmd_low:
-            desired_no_cmd_rate = target_no_cmd_high
+        # no_cmd 比例闭环防振：
+        # 1) 先做 EMA 低通，避免“当前瞬时占比”直接驱动下一轮概率；
+        # 2) 加死区，目标附近不再来回修正；
+        # 3) 降低 bias 增益，减小过冲。
+        if not hasattr(self, "no_cmd_rate_ema"):
+            self.no_cmd_rate_ema = torch.tensor([no_cmd_rate_now], dtype=torch.float, device=self.device)
+        ema_alpha = 0.10
+        self.no_cmd_rate_ema = (1.0 - ema_alpha) * self.no_cmd_rate_ema + ema_alpha * no_cmd_rate_now
+        no_cmd_rate_ctrl = float(self.no_cmd_rate_ema.item())
+
+        no_cmd_err_raw = target_no_cmd - no_cmd_rate_ctrl
+        err_deadband = 0.02
+        if abs(no_cmd_err_raw) < err_deadband:
+            no_cmd_err = 0.0
         else:
-            desired_no_cmd_rate = target_no_cmd
-        desired_no_cmd_total = int(round(desired_no_cmd_rate * self.num_envs))
-        desired_no_cmd_total = int(np.clip(
-            desired_no_cmd_total, target_no_cmd_low_count, target_no_cmd_high_count
-        ))
-
-        current_no_cmd_total = int(torch.sum(no_cmd_mask_all.float()).item())
-        current_no_cmd_in_work = int(torch.sum(no_cmd_mask_all[work_env_ids].float()).item())
-        fixed_no_cmd_count = current_no_cmd_total - current_no_cmd_in_work
-        # 额外保护：锁存 no_cmd 不可被本次重采样直接去掉
-        if hasattr(self, "no_cmd_hold_steps"):
-            hold_count_global = int(torch.sum((self.no_cmd_hold_steps > 0).float()).item())
-            fixed_no_cmd_count = max(fixed_no_cmd_count, hold_count_global)
-
-        no_cmd_quota_for_work = desired_no_cmd_total - fixed_no_cmd_count
-        no_cmd_quota_for_work = int(np.clip(no_cmd_quota_for_work, 0, int(work_env_ids.numel())))
+            no_cmd_err = no_cmd_err_raw
+        no_cmd_err = float(np.clip(no_cmd_err, -0.12, 0.12))
+        # 当 no_cmd 占比远高于目标时，提供更强的回拉力度，尽快把样本还给主任务。
+        stair_idle_prob_bias = 0.26 * no_cmd_err
+        flat_idle_prob_bias = 0.60 * no_cmd_err
 
         # 1. 基础采样：调用基类生成包含前后左右、自转的彻底随机全向指令
         super()._resample_commands(work_env_ids)
@@ -2623,10 +2465,6 @@ class G1Robot(LeggedRobot):
             traction_mask = on_stairs_mask & (
                 (~underfoot_flat_mask) | front_jump_mask | local_rough_mask | stair_conf_strong
             )
-            remaining_no_cmd_quota = int(no_cmd_quota_for_work)
-            # no_cmd 仅在“安全候选池”内分配（优先平坦/非牵引样本），
-            # 不再为了凑配额把 no_cmd 回灌到楼梯活跃样本。
-            idle_candidate_env_ids = torch.empty((0,), dtype=torch.long, device=self.device)
 
             if traction_mask.any():
                 traction_env_ids = work_env_ids[traction_mask]
@@ -2652,30 +2490,27 @@ class G1Robot(LeggedRobot):
                     traction_prog = torch.zeros(len(traction_env_ids), device=self.device)
                 stair_idle_prob_env = stair_idle_prob_late + \
                     (stair_idle_prob_early - stair_idle_prob_late) * (1.0 - traction_prog)
+                stair_idle_prob_env = stair_idle_prob_env + stair_idle_prob_bias
                 stair_idle_prob_env = torch.clamp(stair_idle_prob_env, min=0.0, max=0.20)
 
-                # 楼梯 no_cmd 采用“硬配额 + 上限”：
-                # 1) 楼梯只留少量 no_cmd 保底，不挤占主任务样本；
-                # 2) 若全局 no_cmd 配额仍有剩余，优先分给 flat。
+                # 楼梯 no_cmd：概率采样 + 上限截断（保底静止能力，不挤占主任务样本）。
                 stair_idle_cap_ratio = float(getattr(self.cfg.commands, "stair_idle_hard_cap_ratio", 0.05))
                 stair_idle_cap_ratio = float(np.clip(stair_idle_cap_ratio, 0.0, 0.25))
                 stair_idle_cap = int(round(stair_idle_cap_ratio * len(traction_env_ids)))
-                stair_idle_desired = int(round(float(torch.mean(stair_idle_prob_env).item()) * len(traction_env_ids)))
-                stair_idle_quota = min(stair_idle_desired, stair_idle_cap, remaining_no_cmd_quota, len(traction_env_ids))
-
-                idle_mask_stair = torch.zeros(len(traction_env_ids), dtype=torch.bool, device=self.device)
-                if stair_idle_quota > 0:
-                    perm = torch.randperm(len(traction_env_ids), device=self.device)
-                    idle_mask_stair[perm[:stair_idle_quota]] = True
-                    remaining_no_cmd_quota -= stair_idle_quota
+                idle_mask_stair = torch.rand(len(traction_env_ids), device=self.device) < stair_idle_prob_env
+                idle_count = int(torch.sum(idle_mask_stair.float()).item())
+                if idle_count > stair_idle_cap:
+                    idle_indices = torch.where(idle_mask_stair)[0]
+                    keep_perm = torch.randperm(idle_indices.numel(), device=self.device)
+                    keep_ids = idle_indices[keep_perm[:stair_idle_cap]]
+                    new_mask = torch.zeros_like(idle_mask_stair)
+                    new_mask[keep_ids] = True
+                    idle_mask_stair = new_mask
                 active_mask_stair = ~idle_mask_stair
 
                 if idle_mask_stair.any():
                     idle_env_ids = traction_env_ids[idle_mask_stair]
                     _apply_zero_commands(idle_env_ids)
-                    stair_hold_min = float(getattr(self.cfg.commands, "stair_no_cmd_hold_min_s", 1.0))
-                    stair_hold_max = float(getattr(self.cfg.commands, "stair_no_cmd_hold_max_s", 1.8))
-                    _assign_no_cmd_hold(idle_env_ids, hold_min_s=stair_hold_min, hold_max_s=stair_hold_max)
 
                 if active_mask_stair.any():
                     active_env_ids = traction_env_ids[active_mask_stair]
@@ -2726,7 +2561,6 @@ class G1Robot(LeggedRobot):
             flat_mask = ~traction_mask
             if flat_mask.any():
                 flat_env_ids = work_env_ids[flat_mask]
-                idle_candidate_env_ids = flat_env_ids
                 
                 # 读取分布概率
                 flat_idle_prob_base = float(getattr(self.cfg.commands, "flat_idle_prob", 0.12))
@@ -2736,31 +2570,19 @@ class G1Robot(LeggedRobot):
                 else:
                     instab = 0.0
                 instab_boost = max(0.0, min((instab - 0.18) / 0.82, 1.0))
-                flat_idle_prob = min(0.30, flat_idle_prob_base + 0.10 * instab_boost)
+                flat_idle_prob = flat_idle_prob_base + 0.03 * instab_boost + flat_idle_prob_bias
+                flat_idle_prob = float(np.clip(flat_idle_prob, 0.0, 0.20))
                 flat_forward_prob = float(getattr(self.cfg.commands, "flat_forward_prob", 0.78))
                 flat_yaw_range = abs(float(getattr(self.cfg.commands, "flat_yaw_range", 0.1)))
 
-                # flat no_cmd 采用硬配额：在保证主任务样本不断供前提下尽量满足全局 no_cmd 目标带
-                flat_idle_desired = int(round(flat_idle_prob * len(flat_env_ids)))
-                flat_idle_quota = min(max(flat_idle_desired, 0), remaining_no_cmd_quota, len(flat_env_ids))
-                # 若总配额仍未满足，允许 flat 分支补齐剩余预算
-                if remaining_no_cmd_quota > flat_idle_quota:
-                    flat_idle_quota = min(remaining_no_cmd_quota, len(flat_env_ids))
-
-                idle_mask_flat = torch.zeros(len(flat_env_ids), dtype=torch.bool, device=self.device)
-                if flat_idle_quota > 0:
-                    flat_perm = torch.randperm(len(flat_env_ids), device=self.device)
-                    idle_mask_flat[flat_perm[:flat_idle_quota]] = True
-                    remaining_no_cmd_quota -= flat_idle_quota
+                # flat no_cmd：概率采样（去掉硬配额回收，减小脉冲）。
+                idle_mask_flat = torch.rand(len(flat_env_ids), device=self.device) < flat_idle_prob
                 active_mask_flat = ~idle_mask_flat
 
                 # 先处理零命令样本：专门训练“无命令就停住”
                 if idle_mask_flat.any():
                     idle_env_ids = flat_env_ids[idle_mask_flat]
                     _apply_zero_commands(idle_env_ids)
-                    flat_hold_min = float(getattr(self.cfg.commands, "flat_no_cmd_hold_min_s", 3.0))
-                    flat_hold_max = float(getattr(self.cfg.commands, "flat_no_cmd_hold_max_s", 5.0))
-                    _assign_no_cmd_hold(idle_env_ids, hold_min_s=flat_hold_min, hold_max_s=flat_hold_max)
 
                 # 有指令活动的机器人
                 if active_mask_flat.any():
@@ -2809,40 +2631,6 @@ class G1Robot(LeggedRobot):
                         # 标记为探索样本，免除视觉老司机的纠偏，并给探索任务适当降权
                         if hasattr(self, "explore_cmd_mask"):
                             self.explore_cmd_mask[explore_env_ids] = True
-
-            # 最终配额回收：避免 accidental no_cmd（尤其非 hold 的 near-zero 命令）污染 no_cmd 集合质量
-            no_cmd_mask_post = self._get_no_cmd_mask()
-            no_cmd_total_post = int(torch.sum(no_cmd_mask_post.float()).item())
-            desired_no_cmd_total = int(np.clip(desired_no_cmd_total, 0, self.num_envs))
-
-            hold_mask_all = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-            if hasattr(self, "no_cmd_hold_steps"):
-                hold_mask_all = self.no_cmd_hold_steps > 0
-
-            # no_cmd 过量：优先把“非 hold 的 no_cmd”转回有效运动命令
-            if no_cmd_total_post > desired_no_cmd_total:
-                excess = no_cmd_total_post - desired_no_cmd_total
-                mutable_pool = work_env_ids[no_cmd_mask_post[work_env_ids] & (~hold_mask_all[work_env_ids])]
-                if mutable_pool.numel() > 0:
-                    take = min(excess, int(mutable_pool.numel()))
-                    perm = torch.randperm(mutable_pool.numel(), device=self.device)
-                    to_activate = mutable_pool[perm[:take]]
-                    _apply_min_active_commands(to_activate)
-
-            # no_cmd 不足：在当前批次里补齐（优先平地风格 hold）
-            no_cmd_mask_post = self._get_no_cmd_mask()
-            no_cmd_total_post = int(torch.sum(no_cmd_mask_post.float()).item())
-            if no_cmd_total_post < desired_no_cmd_total:
-                shortage = desired_no_cmd_total - no_cmd_total_post
-                add_pool = idle_candidate_env_ids[~no_cmd_mask_post[idle_candidate_env_ids]]
-                if add_pool.numel() > 0:
-                    take = min(shortage, int(add_pool.numel()))
-                    perm = torch.randperm(add_pool.numel(), device=self.device)
-                    to_idle = add_pool[perm[:take]]
-                    _apply_zero_commands(to_idle)
-                    flat_hold_min = float(getattr(self.cfg.commands, "flat_no_cmd_hold_min_s", 3.0))
-                    flat_hold_max = float(getattr(self.cfg.commands, "flat_no_cmd_hold_max_s", 5.0))
-                    _assign_no_cmd_hold(to_idle, hold_min_s=flat_hold_min, hold_max_s=flat_hold_max)
 
     def _debug_visualize_training(self, depth_tensor):
         try:
@@ -2948,15 +2736,21 @@ class G1Robot(LeggedRobot):
         # 仅绘制“当前处于规划任务”或“置信度足够”的脚，减少画面噪声
         draw_mask = plan_active | (plan_conf > 0.35)
 
-        # Play 可视化：按“基座速度方向”扩展预测落足矩形（而非当前脚朝向）。
+        # Play 可视化：矩形朝向使用“楼梯轴向（带符号）”，避免瞬时侧向速度导致的斜矩形观感。
         yaw = self.rpy[env_idx, 2]
-        yaw_fwd = torch.stack([torch.cos(yaw), torch.sin(yaw)], dim=0)
-        base_vel_xy = self.root_states[env_idx, 7:9]
-        base_vel_norm = torch.norm(base_vel_xy, p=2)
-        if float(base_vel_norm.item()) > 0.05:
-            fwd_unit = base_vel_xy / (base_vel_norm + 1e-6)
+        body_fwd = torch.stack([torch.cos(yaw), torch.sin(yaw)], dim=0)
+        if hasattr(self, "height_grad_x_map") and hasattr(self, "height_grad_y_map"):
+            stair_axis, _, _, _ = self._estimate_stair_axis_state()
+            axis = stair_axis[env_idx]
+            cmd_axis_proj = torch.dot(self.commands[env_idx, :2], axis)
+            body_axis_proj = torch.dot(body_fwd, axis)
+            axis_sign_hint = cmd_axis_proj if torch.abs(cmd_axis_proj) > 0.03 else body_axis_proj
+            axis_sign = torch.sign(axis_sign_hint)
+            if float(torch.abs(axis_sign).item()) < 1e-5:
+                axis_sign = torch.tensor(1.0, device=self.device, dtype=torch.float32)
+            fwd_unit = axis * axis_sign
         else:
-            fwd_unit = yaw_fwd
+            fwd_unit = body_fwd / (torch.norm(body_fwd) + 1e-6)
         foot_fwd = fwd_unit.view(1, 2).repeat(feet_num, 1)
         foot_lat = torch.stack([-foot_fwd[:, 1], foot_fwd[:, 0]], dim=-1)
 
@@ -3318,24 +3112,6 @@ class G1Robot(LeggedRobot):
             self.planner_diag_touch_z_err_sum[env_ids] = 0.0
         if hasattr(self, "planner_diag_touch_xy_err_max"):
             self.planner_diag_touch_xy_err_max[env_ids] = 0.0
-        # 记录本次 reset 是否由 timeout 触发：
-        # 仅 timeout reset 允许保留 no_cmd hold，跌倒/碰撞 reset 一律清空。
-        #
-        # 关键时序修复：
-        # super().reset_idx(...) 内部会调用 _resample_commands(...)。
-        # 若在此之前不清理“跌倒样本”的旧 hold，_resample_commands 会把这些环境当作 hold_active，
-        # 导致本次 reset 直接继续零命令，形成“hold 清掉了但命令仍是 0”的假 no_cmd 污染。
-        timeout_reset_mask = None
-        if hasattr(self, "time_out_buf"):
-            timeout_reset_mask = self.time_out_buf[env_ids].clone()
-        if hasattr(self, "no_cmd_hold_steps"):
-            if timeout_reset_mask is None:
-                # 无法区分 timeout 时，保守地先清空，避免旧 hold 污染重采样。
-                self.no_cmd_hold_steps[env_ids] = 0
-            else:
-                non_timeout_env_ids = env_ids[~timeout_reset_mask]
-                if non_timeout_env_ids.numel() > 0:
-                    self.no_cmd_hold_steps[non_timeout_env_ids] = 0
         # 必须调用父类的 reset_idx，否则机器人摔倒后不会重置！
         super().reset_idx(env_ids)
         if hasattr(self, "episode_stair_conf_sum"):
@@ -3364,9 +3140,6 @@ class G1Robot(LeggedRobot):
                 gymtorch.unwrap_tensor(env_ids_int32),
                 len(env_ids_int32),
             )
-        # 注意：super().reset_idx(...) 内部已完成本回合 no_cmd hold 分配。
-        # 这里只清理“旧回合残留 hold”（在 super 前处理），不再二次覆写新分配结果，
-        # 否则会产生“命令为 0 但 hold=0”的 non-hold 脏样本。
         # 相位状态机重置：按回合初始命令选择 RUN/HOLD，避免跨回合残留状态污染
         if hasattr(self, "phase"):
             self.phase[env_ids] = 0.0
@@ -4876,60 +4649,133 @@ class G1Robot(LeggedRobot):
         return total_penalty * forward_command_mask * stair_gate
 
     def _reward_stand_still(self):
-        no_cmd_mask = self._get_no_cmd_mask().float()
+        no_cmd_bool = self._get_no_cmd_mask()
+        no_cmd_mask = no_cmd_bool.float()
+        rewards_cfg = self.cfg.rewards
 
-        # 正向稳定分：越稳分越高（0~1.x），仅在 no_cmd 生效。
-        lin_xy_sq = torch.sum(torch.square(self.base_lin_vel[:, :2]), dim=1)
-        lin_z_sq = torch.square(self.base_lin_vel[:, 2])
-        yaw_abs = torch.abs(self.base_ang_vel[:, 2])
-        yaw_rate_sq = torch.square(self.base_ang_vel[:, 2])
-        roll_sq = torch.square(self.rpy[:, 0])
-        pitch_sq = torch.square(self.rpy[:, 1])
-        # 额外后仰量：针对“脚尖上翘后慢慢向后倒”
-        back_fall = torch.clamp(-self.rpy[:, 1] - 0.08, min=0.0, max=1.5)
-        back_fall_sq = torch.square(back_fall)
-        dof_vel_sq = torch.mean(torch.square(self.dof_vel), dim=1)
-        foot_speed_sq = torch.square(torch.mean(torch.norm(self.feet_vel[:, :, :2], dim=2), dim=1))
+        # 1) 目标姿态误差（默认关节姿态）
+        pose_err = torch.abs(self.dof_pos - self.default_dof_pos)
+        joint_tol = float(getattr(rewards_cfg, "stand_still_joint_tol_rad", 0.10))
+        joint_hard = float(getattr(rewards_cfg, "stand_still_joint_hard_rad", 0.30))
+        joint_over = torch.clamp(pose_err - joint_tol, min=0.0)
+        joint_cost = torch.mean(torch.square(joint_over), dim=1)
+        joint_hard_ratio = torch.mean((pose_err > joint_hard).float(), dim=1)
+
+        # 2) 机身姿态误差（roll/pitch 贴近期望直立）
+        roll_abs = torch.abs(self.rpy[:, 0])
+        pitch_abs = torch.abs(self.rpy[:, 1])
+        roll_tol = float(getattr(rewards_cfg, "stand_still_roll_tol_rad", 0.10))
+        pitch_tol = float(getattr(rewards_cfg, "stand_still_pitch_tol_rad", 0.10))
+        roll_hard = float(getattr(rewards_cfg, "stand_still_roll_hard_rad", 0.28))
+        pitch_hard = float(getattr(rewards_cfg, "stand_still_pitch_hard_rad", 0.30))
+        roll_cost = torch.square(torch.clamp(roll_abs - roll_tol, min=0.0))
+        pitch_cost = torch.square(torch.clamp(pitch_abs - pitch_tol, min=0.0))
+        tilt_cost = roll_cost + pitch_cost
+        tilt_hard = ((roll_abs > roll_hard) | (pitch_abs > pitch_hard)).float()
+
+        # 3) 静止误差（站姿正确但仍然滑动/自转也要扣分）
+        lin_speed = torch.norm(self.base_lin_vel[:, :2], dim=1)
+        yaw_rate_abs = torch.abs(self.base_ang_vel[:, 2])
+        lin_tol = float(getattr(rewards_cfg, "stand_still_lin_speed_tol", 0.05))
+        yaw_tol = float(getattr(rewards_cfg, "stand_still_yaw_rate_tol", 0.10))
+        lin_hard = float(getattr(rewards_cfg, "stand_still_lin_speed_hard", 0.20))
+        yaw_hard = float(getattr(rewards_cfg, "stand_still_yaw_rate_hard", 0.35))
+        lin_cost = torch.square(torch.clamp(lin_speed - lin_tol, min=0.0))
+        yaw_cost = torch.square(torch.clamp(yaw_rate_abs - yaw_tol, min=0.0))
+        motion_cost = lin_cost + yaw_cost
+        motion_hard = ((lin_speed > lin_hard) | (yaw_rate_abs > yaw_hard)).float()
+
+        # 4) 双支撑约束：0 指令下明确偏好双脚同时支撑
         left_contact = self.contact_forces[:, self.feet_indices[0], 2] > 1.2
         right_contact = self.contact_forces[:, self.feet_indices[1], 2] > 1.2
         single_support = (left_contact ^ right_contact).float()
         double_flight = ((~left_contact) & (~right_contact)).float()
-        stable_double_support = (left_contact & right_contact).float()
+        double_support = (left_contact & right_contact).float()
+        support_cost = 0.8 * single_support + 2.5 * double_flight
 
-        motion_cost = (
-            2.20 * lin_xy_sq
-            + 1.00 * lin_z_sq
-            + 2.50 * yaw_rate_sq
-            + 1.20 * torch.clamp(yaw_abs - 0.08, min=0.0, max=6.0)
-            + 0.95 * roll_sq
-            + 0.70 * pitch_sq
-            + 0.80 * back_fall_sq
-            + 0.35 * dof_vel_sq
-            + 0.30 * foot_speed_sq
-            + 0.45 * single_support
-            + 1.20 * double_flight
+        posture_cost = (
+            4.2 * joint_cost
+            + 3.0 * tilt_cost
+            + 2.4 * lin_cost
+            + 2.2 * yaw_cost
+            + 1.8 * support_cost
         )
-        # reset 早期更严格：抑制“reset 后先抖动再倒”的行为
-        warm_steps = 45.0
-        if hasattr(self, "episode_length_buf"):
-            reset_phase = torch.clamp((warm_steps - self.episode_length_buf.float()) / warm_steps, min=0.0, max=1.0)
-        else:
-            reset_phase = torch.zeros(self.num_envs, device=self.device)
-        motion_cost = motion_cost + reset_phase * (0.40 * yaw_abs + 0.25 * torch.abs(self.rpy[:, 1]))
-        motion_cost = torch.clamp(motion_cost, min=0.0, max=10.0)
 
-        # 基础稳定分 + 双支撑稳态加分
-        stable_score = torch.exp(-motion_cost)
-        support_bonus = torch.exp(
-            -(
-                7.0 * lin_xy_sq
-                + 2.5 * yaw_rate_sq
-                + 2.0 * roll_sq
-                + 1.5 * pitch_sq
-            )
-        ) * stable_double_support
-        stand_score = torch.clamp(0.78 * stable_score + 0.42 * support_bonus, min=0.0, max=1.20)
+        sigma = max(float(getattr(rewards_cfg, "stand_still_pose_sigma", 0.20)), 1e-4)
+        base_score = torch.exp(-posture_cost / sigma)
+
+        # 5) 超阈值惩罚：保留但弱化为“软扣分”，避免策略因强硬扣分倾向快速重置
+        hard_violation = (
+            joint_hard_ratio
+            + (roll_abs > roll_hard).float()
+            + (pitch_abs > pitch_hard).float()
+            + (lin_speed > lin_hard).float()
+            + (yaw_rate_abs > yaw_hard).float()
+        )
+        hard_penalty = torch.clamp(hard_violation / 5.0, min=0.0, max=1.0)
+        hard_penalty_scale = float(getattr(rewards_cfg, "stand_still_hard_penalty_scale", 0.12))
+        hard_penalty_scale = float(np.clip(hard_penalty_scale, 0.0, 0.5))
+        stand_score = torch.clamp(base_score - hard_penalty_scale * hard_penalty, min=0.0, max=1.0)
+
+        # 细分诊断（仅统计 no_cmd 子集），用于快速定位站立问题来源。
+        if not hasattr(self, "extras"):
+            self.extras = {}
+        no_cmd_count = torch.sum(no_cmd_mask)
+        no_cmd_count_val = float(no_cmd_count.item())
+        if no_cmd_count_val > 0.5:
+            inv_count = 1.0 / no_cmd_count_val
+            self.extras["Diagnostics/stand_score_no_cmd"] = float(torch.sum(stand_score * no_cmd_mask).item() * inv_count)
+            self.extras["Diagnostics/stand_joint_cost_no_cmd"] = float(torch.sum(joint_cost * no_cmd_mask).item() * inv_count)
+            self.extras["Diagnostics/stand_tilt_cost_no_cmd"] = float(torch.sum(tilt_cost * no_cmd_mask).item() * inv_count)
+            self.extras["Diagnostics/stand_motion_cost_no_cmd"] = float(torch.sum(motion_cost * no_cmd_mask).item() * inv_count)
+            self.extras["Diagnostics/stand_support_cost_no_cmd"] = float(torch.sum(support_cost * no_cmd_mask).item() * inv_count)
+            self.extras["Diagnostics/stand_hard_joint_rate_no_cmd"] = float(torch.sum(joint_hard_ratio * no_cmd_mask).item() * inv_count)
+            self.extras["Diagnostics/stand_hard_tilt_rate_no_cmd"] = float(torch.sum(tilt_hard * no_cmd_mask).item() * inv_count)
+            self.extras["Diagnostics/stand_hard_motion_rate_no_cmd"] = float(torch.sum(motion_hard * no_cmd_mask).item() * inv_count)
+            self.extras["Diagnostics/stand_hard_penalty_no_cmd"] = float(torch.sum(hard_penalty * no_cmd_mask).item() * inv_count)
+            self.extras["Diagnostics/stand_double_support_rate_no_cmd"] = float(torch.sum(double_support * no_cmd_mask).item() * inv_count)
+        else:
+            self.extras["Diagnostics/stand_score_no_cmd"] = 0.0
+            self.extras["Diagnostics/stand_joint_cost_no_cmd"] = 0.0
+            self.extras["Diagnostics/stand_tilt_cost_no_cmd"] = 0.0
+            self.extras["Diagnostics/stand_motion_cost_no_cmd"] = 0.0
+            self.extras["Diagnostics/stand_support_cost_no_cmd"] = 0.0
+            self.extras["Diagnostics/stand_hard_joint_rate_no_cmd"] = 0.0
+            self.extras["Diagnostics/stand_hard_tilt_rate_no_cmd"] = 0.0
+            self.extras["Diagnostics/stand_hard_motion_rate_no_cmd"] = 0.0
+            self.extras["Diagnostics/stand_hard_penalty_no_cmd"] = 0.0
+            self.extras["Diagnostics/stand_double_support_rate_no_cmd"] = 0.0
         return no_cmd_mask * stand_score
+
+    def _compute_torques(self, actions):
+        """零指令下抑制动作幅值，避免策略在 no_cmd 样本中持续摆腿前窜。"""
+        filtered_actions = actions
+        if hasattr(self, "_get_no_cmd_mask"):
+            no_cmd_mask = self._get_no_cmd_mask()
+        else:
+            no_cmd_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+        if hasattr(self, "phase_mode"):
+            settling_mode = 1
+            hold_mode = 2
+            settling_mask = self.phase_mode == settling_mode
+            hold_mask = self.phase_mode == hold_mode
+        else:
+            settling_mask = torch.zeros_like(no_cmd_mask)
+            hold_mask = torch.zeros_like(no_cmd_mask)
+
+        freeze_mask = no_cmd_mask | hold_mask
+        if freeze_mask.any() or settling_mask.any():
+            filtered_actions = actions.clone()
+            freeze_scale = float(getattr(self.cfg.commands, "no_cmd_action_scale", 0.12))
+            settling_scale = float(getattr(self.cfg.commands, "no_cmd_settling_action_scale", 0.35))
+            freeze_scale = float(np.clip(freeze_scale, 0.0, 1.0))
+            settling_scale = float(np.clip(settling_scale, 0.0, 1.0))
+            if settling_mask.any():
+                filtered_actions[settling_mask] *= settling_scale
+            if freeze_mask.any():
+                filtered_actions[freeze_mask] *= freeze_scale
+        return super()._compute_torques(filtered_actions)
 
     def _reward_contact(self):
         """ 奖励左右腿步态交替（去重版：楼梯阶段降低与 alternation 的正向重叠） """

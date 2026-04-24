@@ -61,33 +61,28 @@ class G1RoughCfg( LeggedRobotCfg ):
         # 平地随机角速度范围（_resample_commands 中使用）
         flat_yaw_range = 0.1
         # 平地零命令样本占比（受全局 no_cmd governor 约束）
-        flat_idle_prob = 0.14
+        flat_idle_prob = 0.06
         # 非零样本里前向牵引比例
         flat_forward_prob = 0.78
         # 楼梯牵引最小前进速度（过高会抑制交替稳定并提高摔倒率）
         stair_min_forward = 0.30
         # 楼梯区保留少量零指令样本：静止能力不断档，但不压过上楼主任务
-        stair_idle_prob = 0.03
-        stair_idle_prob_early = 0.05
-        stair_idle_prob_late = 0.02
+        stair_idle_prob = 0.01
+        stair_idle_prob_early = 0.015
+        stair_idle_prob_late = 0.005
         # 全局 no_cmd 比例目标带：主任务优先，同时保留静止能力
-        target_no_cmd_rate = 0.12
-        target_no_cmd_rate_low = 0.08
-        target_no_cmd_rate_high = 0.16
+        target_no_cmd_rate = 0.08
+        target_no_cmd_rate_low = 0.05
+        target_no_cmd_rate_high = 0.10
         # 楼梯牵引样本里的 no_cmd 硬上限（剩余 no_cmd 配额优先分给 flat）
-        stair_idle_hard_cap_ratio = 0.05
-        # 默认零指令连续片段锁存时长（秒）：用于平地静止训练
-        no_cmd_hold_min_s = 2.0
-        no_cmd_hold_max_s = 3.2
-        # 楼梯活跃样本上的零指令短锁存：保留静止能力，同时不打断爬楼主任务
-        stair_no_cmd_hold_min_s = 0.6
-        stair_no_cmd_hold_max_s = 1.2
-        # 平地静止样本锁存（与默认一致，显式化便于调参）
-        flat_no_cmd_hold_min_s = 2.0
-        flat_no_cmd_hold_max_s = 3.2
+        stair_idle_hard_cap_ratio = 0.02
+        # 零指令动作抑制：保留少量动作余量，避免“完全锁死动作”导致平衡能力退化
+        no_cmd_action_scale = 0.16
+        # RUN->HOLD 过渡态动作缩放，减小切换瞬间抖动
+        no_cmd_settling_action_scale = 0.35
         # 统一零指令判据阈值（所有 no_cmd 门控共用）
-        no_cmd_planar_thr = 0.05
-        no_cmd_yaw_thr = 0.05
+        no_cmd_planar_thr = 0.03
+        no_cmd_yaw_thr = 0.03
         class ranges:
             lin_vel_x = [-0.5, 1.0] # min max [m/s]
             lin_vel_y = [-0.5, 0.5]   # min max [m/s]
@@ -125,9 +120,9 @@ class G1RoughCfg( LeggedRobotCfg ):
         num_actions = 12
         # 课程升降级详细打印（默认关闭，避免大规模并行训练被日志拖慢）
         log_curriculum_events = False
-        # 课程 gate 细分指标：先关闭，减少训练日志开销
-        log_curriculum_gate_details = False
-        # 距离明细指标：先关闭，必要时再用于定位问题
+        # 地形课程曲线控制：只保留 6 条核心曲线
+        # （通过 wandb_extra_keys_keep 精确白名单，而非 Metrics/ 前缀全放行）
+        log_curriculum_gate_details = True
         log_distance_detail_metrics = False
         # 回合奖励曲线白名单：保留核心训练信号 + 少量可排障分项
         episode_reward_log_keys = [
@@ -147,34 +142,45 @@ class G1RoughCfg( LeggedRobotCfg ):
             "action_rate",
         ]
         # 实时 extras 白名单：保留课程推进、零指令稳定性、planner 闭环与调度关键信号
-        # Metrics/ 走前缀放行：恢复原有课程/地形相关曲线，避免 key 变动时被白名单误杀。
-        wandb_extra_prefixes_keep = [
-            "Metrics/",
-        ]
+        # 关闭 Metrics/ 前缀全放行，避免地形曲线“全量展开”。
+        wandb_extra_prefixes_keep = []
         wandb_extra_keys_keep = [
             "metrics/full_contact_rate",
-            "Diagnostics/sched_planner_miss_boost",
-            "Diagnostics/sched_no_cmd_boost",
+            # Terrain（固定 6 条）
+            "Metrics/metrics_terrain_progress",
+            "Metrics/mean_distance",
+            "Metrics/mean_distance_final",
+            "Metrics/move_up_stair_nav_gate_rate",
+            "Metrics/move_up_ready_rate",
+            "Metrics/move_up_dist_gate_rate",
+            # no_cmd 核心稳定性
             "Diagnostics/no_cmd_rate",
-            "Diagnostics/no_cmd_hold_rate",
             "Diagnostics/no_cmd_yaw_rate_mean",
             "Diagnostics/no_cmd_instability_ema",
             "Diagnostics/no_cmd_single_support_rate",
             "Diagnostics/no_cmd_double_flight_rate",
+            "Diagnostics/env_test_flag",
+            "Diagnostics/allow_test_resample_flag",
+            # stand_still 细分诊断（用于定位姿态/速度/支撑哪一项失稳）
+            "Diagnostics/stand_score_no_cmd",
+            "Diagnostics/stand_joint_cost_no_cmd",
+            "Diagnostics/stand_tilt_cost_no_cmd",
+            "Diagnostics/stand_motion_cost_no_cmd",
+            "Diagnostics/stand_support_cost_no_cmd",
+            "Diagnostics/stand_hard_joint_rate_no_cmd",
+            "Diagnostics/stand_hard_tilt_rate_no_cmd",
+            "Diagnostics/stand_hard_motion_rate_no_cmd",
+            "Diagnostics/stand_hard_penalty_no_cmd",
+            "Diagnostics/stand_double_support_rate_no_cmd",
+            # planner 核心闭环
             "Diagnostics/planner_xy_err_ema",
             "Diagnostics/planner_touch_count_step",
             "Diagnostics/planner_hit8_ema",
             "Diagnostics/planner_hit4_ema",
-            "Diagnostics/clearance_xy_err_ema",
-            "Diagnostics/clearance_z_err_ema",
+            # reset 核心统计
             "Diagnostics/reset_rate_step",
-            "Diagnostics/reset_no_cmd_share_step",
-            "Diagnostics/reset_move_cmd_share_step",
-            "Diagnostics/reset_episode_len_no_cmd_ema",
-            "Diagnostics/reset_episode_len_move_cmd_ema",
             "Diagnostics/reset_reason_contact_share_cum",
             "Diagnostics/reset_reason_pose_share_cum",
-            "Diagnostics/reset_reason_timeout_share_cum",
         ]
         # Play 手动控制模式：开启后，环境不再覆盖外部下发的速度/角速度指令
         manual_cmd_override = False
@@ -183,7 +189,7 @@ class G1RoughCfg( LeggedRobotCfg ):
         # 姿态终止阈值（弧度）：与上游逻辑对齐
         terminate_pitch = 1.0
         terminate_roll = 0.8
-        terminate_pose_consecutive_steps = 1
+        terminate_pose_consecutive_steps = 2
         terminate_contact_force = 2.0
         terminate_contact_consecutive_steps = 2
         # num_observations = 47 + 160
@@ -311,6 +317,20 @@ class G1RoughCfg( LeggedRobotCfg ):
         explore_task_weight = 0.30
         # 全贴合判定阈值：脚角点离地超过该高度视为悬空（米）
         full_contact_edge_threshold = 0.01
+        # 零指令站立：目标姿态阈值（接近目标给分，超阈值惩罚）
+        stand_still_joint_tol_rad = 0.10
+        stand_still_joint_hard_rad = 0.30
+        stand_still_roll_tol_rad = 0.10
+        stand_still_pitch_tol_rad = 0.10
+        stand_still_roll_hard_rad = 0.28
+        stand_still_pitch_hard_rad = 0.30
+        stand_still_lin_speed_tol = 0.05
+        stand_still_yaw_rate_tol = 0.10
+        stand_still_lin_speed_hard = 0.20
+        stand_still_yaw_rate_hard = 0.35
+        stand_still_pose_sigma = 0.20
+        # 软扣分强度：越小越不容易出现“为了避罚而主动重置”
+        stand_still_hard_penalty_scale = 0.12
         
         class scales( LeggedRobotCfg.rewards.scales ):
             # --- 基础运动奖励 ---
