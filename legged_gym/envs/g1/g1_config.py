@@ -71,18 +71,18 @@ class G1RoughCfg( LeggedRobotCfg ):
         stair_idle_prob_early = 0.015
         stair_idle_prob_late = 0.005
         # 全局 no_cmd 比例目标带：主任务优先，同时保留静止能力
-        target_no_cmd_rate = 0.08
-        target_no_cmd_rate_low = 0.05
-        target_no_cmd_rate_high = 0.10
+        target_no_cmd_rate = 0.10
+        target_no_cmd_rate_low = 0.07
+        target_no_cmd_rate_high = 0.12
         # 楼梯牵引样本里的 no_cmd 硬上限（剩余 no_cmd 配额优先分给 flat）
         stair_idle_hard_cap_ratio = 0.02
         # 零指令动作抑制：保留少量动作余量，避免“完全锁死动作”导致平衡能力退化
-        no_cmd_action_scale = 0.16
+        no_cmd_action_scale = 0.10
         # RUN->HOLD 过渡态动作缩放，减小切换瞬间抖动
-        no_cmd_settling_action_scale = 0.35
+        no_cmd_settling_action_scale = 0.28
         # 统一零指令判据阈值（所有 no_cmd 门控共用）
-        no_cmd_planar_thr = 0.03
-        no_cmd_yaw_thr = 0.03
+        no_cmd_planar_thr = 0.05
+        no_cmd_yaw_thr = 0.05
         class ranges:
             lin_vel_x = [-0.5, 1.0] # min max [m/s]
             lin_vel_y = [-0.5, 0.5]   # min max [m/s]
@@ -159,22 +159,17 @@ class G1RoughCfg( LeggedRobotCfg ):
             "Diagnostics/no_cmd_instability_ema",
             "Diagnostics/no_cmd_single_support_rate",
             "Diagnostics/no_cmd_double_flight_rate",
-            "Diagnostics/env_test_flag",
-            "Diagnostics/allow_test_resample_flag",
-            # stand_still 细分诊断（用于定位姿态/速度/支撑哪一项失稳）
+            "Diagnostics/move_double_flight_rate",
+            # stand_still 精简诊断
             "Diagnostics/stand_score_no_cmd",
-            "Diagnostics/stand_joint_cost_no_cmd",
-            "Diagnostics/stand_tilt_cost_no_cmd",
             "Diagnostics/stand_motion_cost_no_cmd",
-            "Diagnostics/stand_support_cost_no_cmd",
-            "Diagnostics/stand_hard_joint_rate_no_cmd",
-            "Diagnostics/stand_hard_tilt_rate_no_cmd",
-            "Diagnostics/stand_hard_motion_rate_no_cmd",
-            "Diagnostics/stand_hard_penalty_no_cmd",
             "Diagnostics/stand_double_support_rate_no_cmd",
+            # alternation 解耦后分量诊断（dz vs switch）
+            "Diagnostics/alt_dz_score_step",
+            "Diagnostics/alt_switch_score_step",
+            "Diagnostics/alt_switch_event_rate_step",
             # planner 核心闭环
             "Diagnostics/planner_xy_err_ema",
-            "Diagnostics/planner_touch_count_step",
             "Diagnostics/planner_hit8_ema",
             "Diagnostics/planner_hit4_ema",
             # reset 核心统计
@@ -363,7 +358,7 @@ class G1RoughCfg( LeggedRobotCfg ):
             orientation = -0.3#-0.5          # [负向] 惩罚基座倾斜
             # 1. 惩罚脚掌与地面不平行 (专治脚尖绷直、蝎子摆尾)
             # 小权重保留：强化“全脚掌贴合”，特别是静止与落足末段
-            foot_flatness = -0.10
+            foot_flatness = -0.15
             
             pelvis_height = 0.10
 
