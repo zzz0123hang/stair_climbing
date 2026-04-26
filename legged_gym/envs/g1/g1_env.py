@@ -1042,8 +1042,19 @@ class G1Robot(LeggedRobot):
             self.foothold_plan_ttl_steps,
             torch.zeros_like(self.foothold_plan_ttl_steps),
         )
-        # 脚触地后即关闭该脚激活标记（完成一次摆动闭环），不再依赖 hold/latch。
-        touchdown_stable = contact_now
+        non_task_env = ~planner_task_env
+        if non_task_env.any():
+            self.foothold_plan_conf[non_task_env] = 0.0
+            self.foothold_plan_edge_count[non_task_env] = 0.0
+            self.foothold_plan_top_out[non_task_env] = False
+            self.foothold_plan_new_event[non_task_env] = False
+            self.foothold_plan_dz_goal[non_task_env] = 0.0
+            self.foothold_plan_dz_start[non_task_env] = 0.0
+            self.foothold_plan_target_xy[non_task_env] = self.feet_pos[non_task_env, :, :2]
+            self.foothold_plan_target_z[non_task_env] = self.feet_pos[non_task_env, :, 2]
+        # 脚触地后关闭该脚激活标记：
+        # 仅在“触地窗口(phase<0.30)”判定为稳定触地，避免摆动中途刮碰台阶边缘就提前失活。
+        touchdown_stable = contact_now & (self.leg_phase < 0.30)
         self.foothold_plan_active = torch.where(
             touchdown_stable,
             torch.zeros_like(self.foothold_plan_active),
@@ -1164,15 +1175,9 @@ class G1Robot(LeggedRobot):
             level_gap = torch.round(
                 torch.clamp(level_diff_eff / (step_h + 1e-4), min=0.0, max=3.0)
             ).long()
-            desired_cross = level_gap + 1
-            desired_cross = torch.clamp(desired_cross, min=1, max=sample_num - 1)
-            # 对侧脚也在摆动时（基座来自对侧预测点），只跨 1 级：
-            # 避免出现“一脚 +1 级、另一脚 +2 级”的追赶型失配。
-            desired_cross = torch.where(
-                use_plan_anchor,
-                torch.ones_like(desired_cross),
-                desired_cross
-            )
+            # 统一规则：无论基座来自哪种情况，都只尝试“基座 +1 级”。
+            # 若找不到上一级边缘，再回退到基座同级（后续 lookup 分支处理）。
+            desired_cross = torch.ones_like(level_gap)
 
             cmd_planar = torch.norm(self.commands[env_ids, :2], dim=1)
             move_intent = torch.sigmoid((self.commands[env_ids, 0] - 0.08) / 0.05) * \
@@ -1242,12 +1247,12 @@ class G1Robot(LeggedRobot):
                 # - 目标点落在当前摆动脚的“本脚横向通道”上，避免左右脚目标互相串道；
                 # - 找不到上一级边缘（如最高台阶）=> 回退到“对侧脚当前等级”并投影到摆动脚通道，再 +9cm。
                 has_support_up_edge, support_up_edge_axis = _lookup_front_edge_axis(support_anchor_xy)
+                support_same_level_axis = torch.where(use_x_axis, support_anchor_xy[:, 0], support_anchor_xy[:, 1])
                 # 关键修复：边缘轴向值来自支撑脚，但横向坐标保持摆动脚通道，防止可视化“交叉落点”。
                 swing_lane_xy = start_xy.clone()
                 swing_lane_edge_xy = swing_lane_xy.clone()
                 swing_lane_edge_xy[:, 0] = torch.where(use_x_axis, support_up_edge_axis, swing_lane_edge_xy[:, 0])
                 swing_lane_edge_xy[:, 1] = torch.where(~use_x_axis, support_up_edge_axis, swing_lane_edge_xy[:, 1])
-                support_same_level_axis = torch.where(use_x_axis, support_anchor_xy[:, 0], support_anchor_xy[:, 1])
                 swing_lane_same_level_xy = swing_lane_xy.clone()
                 swing_lane_same_level_xy[:, 0] = torch.where(use_x_axis, support_same_level_axis, swing_lane_same_level_xy[:, 0])
                 swing_lane_same_level_xy[:, 1] = torch.where(~use_x_axis, support_same_level_axis, swing_lane_same_level_xy[:, 1])
@@ -1540,13 +1545,13 @@ class G1Robot(LeggedRobot):
         # 交替节奏项（解耦后独立课程）
         safe_update(
             "stair_alternation",
-            0.24 + 0.70 * late_stage_progress_smooth,
+            0.18 + 0.50 * late_stage_progress_smooth,
             per_env=True
         )
         # Planner 跟踪项（解耦后独立课程，略高于交替节奏，优先保证踩中预测点）
         safe_update(
             "planner_tracking",
-            0.40 + 0.50 * late_stage_progress_smooth,
+            0.52 + 0.63 * late_stage_progress_smooth,
             per_env=True
         )
         ###########
@@ -1841,8 +1846,6 @@ class G1Robot(LeggedRobot):
         self.extras["Diagnostics/no_cmd_double_flight_rate"] = no_cmd_double_flight_rate.item()
         self.extras["Diagnostics/move_double_flight_rate"] = move_double_flight_rate.item()
         self.extras["Diagnostics/no_cmd_yaw_rate_mean"] = no_cmd_yaw_rate_mean.item()
-        self.extras["Diagnostics/env_test_flag"] = 1.0 if bool(getattr(self.cfg.env, "test", False)) else 0.0
-        self.extras["Diagnostics/allow_test_resample_flag"] = 1.0 if bool(getattr(self.cfg.env, "allow_test_resample", False)) else 0.0
         cmd_planar_diag = torch.norm(self.commands[:, :2], dim=1)
         self.extras["Diagnostics/cmd_planar_zero_rate"] = torch.mean((cmd_planar_diag < 0.05).float()).item()
         if hasattr(self, "no_cmd_instability_ema"):
@@ -1875,7 +1878,7 @@ class G1Robot(LeggedRobot):
 
         ds_stable_need = 3
         move_resume_need = 4
-        settle_freq = 0.12
+        settle_freq = float(getattr(self.cfg.commands, "no_cmd_settling_phase_rate", 0.00))
         run_freq_base = 0.85
         run_freq_min = 0.75
         run_freq_max = 2.20
@@ -2124,8 +2127,8 @@ class G1Robot(LeggedRobot):
     
     def compute_observations(self):
         """ 
-        组装学生 (798维) 和 老师 (988维) 的非对称观测向量 
-        学生 = 150维历史本体感受 + 8维planner对齐特征 + 640维视觉特征
+        组装学生 (808维) 和 老师 (998维) 的非对称观测向量 
+        学生 = 150维历史本体感受 + 18维planner轨迹切片特征 + 640维视觉特征
         老师 = 学生观测 + 187维地形高度采样 + 3维物理特权参数 (摩擦、负载、真速)
         """
         # 1. 计算当前时间相位 (2 维: sin/cos)
@@ -2138,17 +2141,24 @@ class G1Robot(LeggedRobot):
 
         # 2. 构造当前帧的本体感受数据 (50 维)
         # 顺序必须固定：线速度(3), 角速度(3), 重力投影(3), 指令(3), 关节位置(12), 关节速度(12), 上一次动作(12), 相位(2)
+        cmd_obs = self.commands[:, :3] * self.commands_scale
+        if no_cmd_obs.any():
+            cmd_obs[no_cmd_obs.squeeze(1)] = 0.0
+
         current_proprio = torch.cat((
             self.base_lin_vel * self.obs_scales.lin_vel,           # 3
             self.base_ang_vel * self.obs_scales.ang_vel,           # 3
             self.projected_gravity,                                # 3
-            self.commands[:, :3] * self.commands_scale,            # 3
+            cmd_obs,                                               # 3
             (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos, # 12
             self.dof_vel * self.obs_scales.dof_vel,                # 12
             self.actions,                                          # 12
             sin_phase,                                             # 1
             cos_phase                                              # 1
         ), dim=-1)
+        # 零指令下屏蔽“上一拍动作”观测，减少 residual action 对静止策略的持续诱导
+        if no_cmd_obs.any():
+            current_proprio[no_cmd_obs.squeeze(1), 36:48] = 0.0
 
         # 3. 更新历史堆叠缓冲区 (50 * 3 = 150 维)
         # 如果开启噪声，仅对当前帧加噪，防止历史数据噪声累积
@@ -2173,9 +2183,9 @@ class G1Robot(LeggedRobot):
         else:
             visual_obs = torch.zeros((self.num_envs, 640), device=self.device)
 
-        # 5. Planner 对齐特征 (8 维):
-        #    [每只脚 planner 目标相对误差(dx,dy in body frame)=4, planner conf=2, planner active=2]
-        planner_obs = torch.zeros((self.num_envs, 8), device=self.device)
+        # 5. Planner 轨迹切片特征 (18 维):
+        #    [dx,dy(4), dz_goal(2), z_err_now(2), phase_t(2), time_left(2), dz_start(2), conf(2), active(2)]
+        planner_obs = torch.zeros((self.num_envs, 18), device=self.device)
         if hasattr(self, "foothold_plan_target_xy") and hasattr(self, "feet_pos"):
             plan_delta_w = self.foothold_plan_target_xy - self.feet_pos[:, :, :2]  # (N,2,2)
             yaw = self.rpy[:, 2]
@@ -2185,13 +2195,28 @@ class G1Robot(LeggedRobot):
             dy_b = -sin_yaw * plan_delta_w[:, :, 0] + cos_yaw * plan_delta_w[:, :, 1]
             plan_delta_b = torch.stack([dx_b, dy_b], dim=-1)
             # 归一化到网络友好范围，避免极端落点误差瞬间主导观测
-            planner_obs[:, :4] = torch.clamp(plan_delta_b, min=-0.40, max=0.40).reshape(self.num_envs, -1) * 2.5
+            planner_obs[:, :4] = torch.clamp(plan_delta_b, min=-0.80, max=0.80).reshape(self.num_envs, -1) * 1.25
+            if hasattr(self, "foothold_plan_dz_goal"):
+                planner_obs[:, 4:6] = torch.clamp(self.foothold_plan_dz_goal, min=-0.35, max=0.35) * 2.0
+            if hasattr(self, "foothold_plan_target_z"):
+                z_err_now = self.feet_pos[:, :, 2] - self.foothold_plan_target_z
+                planner_obs[:, 6:8] = torch.clamp(z_err_now, min=-0.30, max=0.30) * 3.0
+            swing_start = 0.55
+            swing_duration_phase = 1.0 - swing_start
+            phase_t = torch.clamp((self.leg_phase - swing_start) / swing_duration_phase, min=0.0, max=1.0)
+            planner_obs[:, 8:10] = phase_t * 2.0 - 1.0
+            time_left_norm = 1.0 - phase_t
+            planner_obs[:, 10:12] = time_left_norm * 2.0 - 1.0
+            if hasattr(self, "foothold_plan_dz_start"):
+                planner_obs[:, 12:14] = torch.clamp(self.foothold_plan_dz_start, min=-0.35, max=0.35) * 2.0
             if hasattr(self, "foothold_plan_conf"):
-                planner_obs[:, 4:6] = torch.clamp(self.foothold_plan_conf, min=0.0, max=1.0)
+                planner_obs[:, 14:16] = torch.clamp(self.foothold_plan_conf, min=0.0, max=1.0)
             if hasattr(self, "foothold_plan_active"):
-                planner_obs[:, 6:8] = self.foothold_plan_active.float()
+                planner_obs[:, 16:18] = self.foothold_plan_active.float()
+            if no_cmd_obs.any():
+                planner_obs[no_cmd_obs.squeeze(1)] = 0.0
 
-        # 6. 【组装学生观测】 (150 + 8 + 640 = 798 维)
+        # 6. 【组装学生观测】 (150 + 18 + 640 = 808 维)
         # 注意：保持最后 640 维是视觉输入，兼容 ActorCriticTS 的视觉切片逻辑。
         self.obs_buf = torch.cat((self.obs_history_buf, planner_obs, visual_obs), dim=-1)
 
@@ -2214,7 +2239,7 @@ class G1Robot(LeggedRobot):
         # 维度 2: 真实前进 X 速度 (上帝视角绝对真值)
         self.privileged_physics_params[:, 2] = self.base_lin_vel[:, 0] * self.obs_scales.lin_vel
         
-        # 8. 【最终输出】 (798 + 187 + 3 = 988 维)
+        # 8. 【最终输出】 (808 + 187 + 3 = 998 维)
         self.privileged_obs_buf = torch.cat((self.obs_buf, heights, self.privileged_physics_params), dim=-1)
 
         # 返回值在基类 step 函数中会被截断处理
@@ -2357,6 +2382,31 @@ class G1Robot(LeggedRobot):
             if hasattr(self, "explore_cmd_mask"):
                 self.explore_cmd_mask[target_env_ids] = False
 
+        def _idle_start_eligible(target_env_ids):
+            """
+            仅在“当前状态足够稳”时注入 no_cmd，避免中途急切零命令把样本推向姿态超限。
+            该门控只影响 no_cmd 子集，不改 move/stair 主任务轨迹。
+            """
+            if target_env_ids.numel() == 0:
+                return torch.zeros(0, dtype=torch.bool, device=self.device)
+            speed_thr = float(getattr(self.cfg.commands, "no_cmd_start_speed_thr", 0.45))
+            yaw_thr = float(getattr(self.cfg.commands, "no_cmd_start_yaw_thr", 0.80))
+            tilt_thr = float(getattr(self.cfg.commands, "no_cmd_start_tilt_thr", 0.50))
+            speed_xy = torch.norm(self.base_lin_vel[target_env_ids, :2], dim=1)
+            yaw_abs = torch.abs(self.base_ang_vel[target_env_ids, 2])
+            roll_abs = torch.abs(self.rpy[target_env_ids, 0])
+            pitch_abs = torch.abs(self.rpy[target_env_ids, 1])
+            left_contact = self.contact_forces[target_env_ids, self.feet_indices[0], 2] > 1.2
+            right_contact = self.contact_forces[target_env_ids, self.feet_indices[1], 2] > 1.2
+            has_support = left_contact | right_contact
+            return (
+                (speed_xy < speed_thr)
+                & (yaw_abs < yaw_thr)
+                & (roll_abs < tilt_thr)
+                & (pitch_abs < tilt_thr)
+                & has_support
+            )
+
         manual_cmd_override = bool(getattr(self.cfg.env, "manual_cmd_override", False))
         allow_test_resample = bool(getattr(self.cfg.env, "allow_test_resample", False))
         if self.cfg.env.test and (manual_cmd_override or (not allow_test_resample)):
@@ -2489,8 +2539,14 @@ class G1Robot(LeggedRobot):
                 active_mask_stair = ~idle_mask_stair
 
                 if idle_mask_stair.any():
-                    idle_env_ids = traction_env_ids[idle_mask_stair]
-                    _apply_zero_commands(idle_env_ids)
+                    idle_indices = torch.where(idle_mask_stair)[0]
+                    idle_env_ids = traction_env_ids[idle_indices]
+                    idle_eligible = _idle_start_eligible(idle_env_ids)
+                    if idle_eligible.any():
+                        _apply_zero_commands(idle_env_ids[idle_eligible])
+                    idle_not_ready = ~idle_eligible
+                    if idle_not_ready.any():
+                        active_mask_stair[idle_indices[idle_not_ready]] = True
 
                 if active_mask_stair.any():
                     active_env_ids = traction_env_ids[active_mask_stair]
@@ -2550,7 +2606,8 @@ class G1Robot(LeggedRobot):
                 else:
                     instab = 0.0
                 instab_boost = max(0.0, min((instab - 0.18) / 0.82, 1.0))
-                flat_idle_prob = flat_idle_prob_base + 0.03 * instab_boost + flat_idle_prob_bias
+                # instability 提升幅度减半，避免与 no_cmd governor 叠加引发占比振荡。
+                flat_idle_prob = flat_idle_prob_base + 0.015 * instab_boost + flat_idle_prob_bias
                 flat_idle_prob = float(np.clip(flat_idle_prob, 0.0, 0.20))
                 flat_forward_prob = float(getattr(self.cfg.commands, "flat_forward_prob", 0.78))
                 flat_yaw_range = abs(float(getattr(self.cfg.commands, "flat_yaw_range", 0.1)))
@@ -2559,10 +2616,16 @@ class G1Robot(LeggedRobot):
                 idle_mask_flat = torch.rand(len(flat_env_ids), device=self.device) < flat_idle_prob
                 active_mask_flat = ~idle_mask_flat
 
-                # 先处理零命令样本：专门训练“无命令就停住”
+                # 先处理零命令样本：仅对“可平稳切换”的子集注入 no_cmd
                 if idle_mask_flat.any():
-                    idle_env_ids = flat_env_ids[idle_mask_flat]
-                    _apply_zero_commands(idle_env_ids)
+                    idle_indices = torch.where(idle_mask_flat)[0]
+                    idle_env_ids = flat_env_ids[idle_indices]
+                    idle_eligible = _idle_start_eligible(idle_env_ids)
+                    if idle_eligible.any():
+                        _apply_zero_commands(idle_env_ids[idle_eligible])
+                    idle_not_ready = ~idle_eligible
+                    if idle_not_ready.any():
+                        active_mask_flat[idle_indices[idle_not_ready]] = True
 
                 # 有指令活动的机器人
                 if active_mask_flat.any():
@@ -3421,8 +3484,6 @@ class G1Robot(LeggedRobot):
             self.alt_prev_contact_feet = torch.zeros((self.num_envs, self.feet_num), dtype=torch.bool, device=self.device)
         touchdown_event = contact_now & (~self.alt_prev_contact_feet) & (self.leg_phase < 0.30)
         touchdown_w = touchdown_event.float()
-        if hasattr(self, "foothold_plan_active"):
-            touchdown_w = touchdown_w * (0.20 + 0.80 * self.foothold_plan_active.float())
         touch_sigma = 0.045
         touch_err = torch.abs(dz_curr - dz_goal)
         touch_term = torch.exp(-torch.square(touch_err) / (2.0 * touch_sigma * touch_sigma)) \
@@ -3617,8 +3678,6 @@ class G1Robot(LeggedRobot):
         effective_cmd_mask = (cmd_forward_soft > 0.35)
         touchdown_event = touchdown_event & effective_cmd_mask.unsqueeze(1)
         touchdown_w = touchdown_event.float()
-        if hasattr(self, "foothold_plan_active"):
-            touchdown_w = touchdown_w * (0.20 + 0.80 * self.foothold_plan_active.float())
 
         hit_thr = 0.12 - 0.07 * late      # 12cm -> 5cm
         pen_thr = 0.20 - 0.10 * late      # 20cm -> 10cm
@@ -4691,7 +4750,7 @@ class G1Robot(LeggedRobot):
         hard_penalty_scale = float(np.clip(hard_penalty_scale, 0.0, 0.5))
         stand_score = torch.clamp(base_score - hard_penalty_scale * hard_penalty, min=0.0, max=1.0)
 
-        # 细分诊断（仅统计 no_cmd 子集），用于快速定位站立问题来源。
+        # 细分诊断（仅统计 no_cmd 子集）：仅保留核心三项，避免面板过载。
         if not hasattr(self, "extras"):
             self.extras = {}
         no_cmd_count = torch.sum(no_cmd_mask)
@@ -4699,30 +4758,16 @@ class G1Robot(LeggedRobot):
         if no_cmd_count_val > 0.5:
             inv_count = 1.0 / no_cmd_count_val
             self.extras["Diagnostics/stand_score_no_cmd"] = float(torch.sum(stand_score * no_cmd_mask).item() * inv_count)
-            self.extras["Diagnostics/stand_joint_cost_no_cmd"] = float(torch.sum(joint_cost * no_cmd_mask).item() * inv_count)
-            self.extras["Diagnostics/stand_tilt_cost_no_cmd"] = float(torch.sum(tilt_cost * no_cmd_mask).item() * inv_count)
             self.extras["Diagnostics/stand_motion_cost_no_cmd"] = float(torch.sum(motion_cost * no_cmd_mask).item() * inv_count)
-            self.extras["Diagnostics/stand_support_cost_no_cmd"] = float(torch.sum(support_cost * no_cmd_mask).item() * inv_count)
-            self.extras["Diagnostics/stand_hard_joint_rate_no_cmd"] = float(torch.sum(joint_hard_ratio * no_cmd_mask).item() * inv_count)
-            self.extras["Diagnostics/stand_hard_tilt_rate_no_cmd"] = float(torch.sum(tilt_hard * no_cmd_mask).item() * inv_count)
-            self.extras["Diagnostics/stand_hard_motion_rate_no_cmd"] = float(torch.sum(motion_hard * no_cmd_mask).item() * inv_count)
-            self.extras["Diagnostics/stand_hard_penalty_no_cmd"] = float(torch.sum(hard_penalty * no_cmd_mask).item() * inv_count)
             self.extras["Diagnostics/stand_double_support_rate_no_cmd"] = float(torch.sum(double_support * no_cmd_mask).item() * inv_count)
         else:
             self.extras["Diagnostics/stand_score_no_cmd"] = 0.0
-            self.extras["Diagnostics/stand_joint_cost_no_cmd"] = 0.0
-            self.extras["Diagnostics/stand_tilt_cost_no_cmd"] = 0.0
             self.extras["Diagnostics/stand_motion_cost_no_cmd"] = 0.0
-            self.extras["Diagnostics/stand_support_cost_no_cmd"] = 0.0
-            self.extras["Diagnostics/stand_hard_joint_rate_no_cmd"] = 0.0
-            self.extras["Diagnostics/stand_hard_tilt_rate_no_cmd"] = 0.0
-            self.extras["Diagnostics/stand_hard_motion_rate_no_cmd"] = 0.0
-            self.extras["Diagnostics/stand_hard_penalty_no_cmd"] = 0.0
             self.extras["Diagnostics/stand_double_support_rate_no_cmd"] = 0.0
         return no_cmd_mask * stand_score
 
     def _compute_torques(self, actions):
-        """零指令下抑制动作幅值，避免策略在 no_cmd 样本中持续摆腿前窜。"""
+        """零指令控制隔离：先恢复稳定，再收紧动作，不影响 move/stair 主任务样本。"""
         filtered_actions = actions
         if hasattr(self, "_get_no_cmd_mask"):
             no_cmd_mask = self._get_no_cmd_mask()
@@ -4738,17 +4783,62 @@ class G1Robot(LeggedRobot):
             settling_mask = torch.zeros_like(no_cmd_mask)
             hold_mask = torch.zeros_like(no_cmd_mask)
 
-        freeze_mask = no_cmd_mask | hold_mask
-        if freeze_mask.any() or settling_mask.any():
+        if no_cmd_mask.any() or settling_mask.any() or hold_mask.any():
             filtered_actions = actions.clone()
-            freeze_scale = float(getattr(self.cfg.commands, "no_cmd_action_scale", 0.12))
+            no_cmd_scale = float(getattr(self.cfg.commands, "no_cmd_action_scale", 0.12))
+            no_cmd_recover_scale = float(getattr(self.cfg.commands, "no_cmd_recover_action_scale", no_cmd_scale))
+            hold_scale = float(getattr(self.cfg.commands, "no_cmd_hold_action_scale", 0.0))
             settling_scale = float(getattr(self.cfg.commands, "no_cmd_settling_action_scale", 0.35))
-            freeze_scale = float(np.clip(freeze_scale, 0.0, 1.0))
+            no_cmd_scale = float(np.clip(no_cmd_scale, 0.0, 1.0))
+            no_cmd_recover_scale = float(np.clip(no_cmd_recover_scale, no_cmd_scale, 1.0))
+            hold_scale = float(np.clip(hold_scale, 0.0, 1.0))
             settling_scale = float(np.clip(settling_scale, 0.0, 1.0))
+            recover_speed = max(float(getattr(self.cfg.commands, "no_cmd_recover_speed", 0.30)), 1e-3)
+            recover_yaw = max(float(getattr(self.cfg.commands, "no_cmd_recover_yaw_rate", 0.55)), 1e-3)
+            pose_gain = float(np.clip(getattr(self.cfg.commands, "no_cmd_pose_action_gain", 0.40), 0.0, 2.0))
+            pose_blend = float(np.clip(getattr(self.cfg.commands, "no_cmd_pose_blend", 0.18), 0.0, 1.0))
+            pose_blend_settling = float(np.clip(getattr(self.cfg.commands, "no_cmd_pose_blend_settling", 0.35), 0.0, 1.0))
+            pose_blend_hold = float(np.clip(getattr(self.cfg.commands, "no_cmd_pose_blend_hold", 0.50), 0.0, 1.0))
+
+            speed_xy = torch.norm(self.base_lin_vel[:, :2], dim=1)
+            yaw_abs = torch.abs(self.base_ang_vel[:, 2])
+            speed_gate = torch.clamp(speed_xy / recover_speed, min=0.0, max=1.0)
+            yaw_gate = torch.clamp(yaw_abs / recover_yaw, min=0.0, max=1.0)
+            recover_gate = torch.maximum(speed_gate, yaw_gate)
+
+            action_scale = max(float(getattr(self.cfg.control, "action_scale", 0.25)), 1e-4)
+            pose_action = torch.clamp(
+                ((self.default_dof_pos - self.dof_pos) / action_scale) * pose_gain,
+                min=-1.0,
+                max=1.0,
+            )
+
+            no_cmd_run_mask = no_cmd_mask & (~settling_mask) & (~hold_mask)
+            if no_cmd_run_mask.any():
+                run_gate = recover_gate[no_cmd_run_mask]
+                run_scale = no_cmd_scale + (no_cmd_recover_scale - no_cmd_scale) * run_gate
+                filtered_actions[no_cmd_run_mask] *= run_scale.unsqueeze(1)
+                run_blend = pose_blend * (1.0 - run_gate)
+                filtered_actions[no_cmd_run_mask] = (
+                    (1.0 - run_blend.unsqueeze(1)) * filtered_actions[no_cmd_run_mask]
+                    + run_blend.unsqueeze(1) * pose_action[no_cmd_run_mask]
+                )
             if settling_mask.any():
-                filtered_actions[settling_mask] *= settling_scale
-            if freeze_mask.any():
-                filtered_actions[freeze_mask] *= freeze_scale
+                settling_gate = recover_gate[settling_mask]
+                settling_scale_env = settling_scale + (no_cmd_recover_scale - settling_scale) * settling_gate
+                filtered_actions[settling_mask] *= settling_scale_env.unsqueeze(1)
+                settling_blend = pose_blend_settling * (1.0 - 0.5 * settling_gate)
+                filtered_actions[settling_mask] = (
+                    (1.0 - settling_blend.unsqueeze(1)) * filtered_actions[settling_mask]
+                    + settling_blend.unsqueeze(1) * pose_action[settling_mask]
+                )
+            if hold_mask.any():
+                filtered_actions[hold_mask] *= hold_scale
+                if pose_blend_hold > 0.0:
+                    filtered_actions[hold_mask] = (
+                        (1.0 - pose_blend_hold) * filtered_actions[hold_mask]
+                        + pose_blend_hold * pose_action[hold_mask]
+                    )
         return super()._compute_torques(filtered_actions)
 
     def _reward_contact(self):

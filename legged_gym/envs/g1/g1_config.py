@@ -77,9 +77,26 @@ class G1RoughCfg( LeggedRobotCfg ):
         # 楼梯牵引样本里的 no_cmd 硬上限（剩余 no_cmd 配额优先分给 flat）
         stair_idle_hard_cap_ratio = 0.02
         # 零指令动作抑制：保留少量动作余量，避免“完全锁死动作”导致平衡能力退化
-        no_cmd_action_scale = 0.10
+        no_cmd_action_scale = 0.06
+        # 零指令恢复期动作上限：当仍有明显速度/偏航时临时放宽，先稳住再收紧
+        no_cmd_recover_action_scale = 0.16
+        no_cmd_recover_speed = 0.30
+        no_cmd_recover_yaw_rate = 0.55
+        # 零指令姿态反馈混合：仅在 no_cmd 下把动作轻度拉回 default 姿态
+        no_cmd_pose_action_gain = 0.40
+        no_cmd_pose_blend = 0.18
+        no_cmd_pose_blend_settling = 0.35
+        no_cmd_pose_blend_hold = 0.50
+        # HOLD 模式动作缩放（建议接近 0，优先锁定 default_dof_pos 站立）
+        no_cmd_hold_action_scale = 0.00
         # RUN->HOLD 过渡态动作缩放，减小切换瞬间抖动
-        no_cmd_settling_action_scale = 0.28
+        no_cmd_settling_action_scale = 0.08
+        # SETTLING 模式相位推进频率（0=不推进，仅靠控制收敛双支撑）
+        no_cmd_settling_phase_rate = 0.00
+        # 仅在“当前状态足够稳定”时才注入 no_cmd 样本，避免中途急刹导致摔倒重置
+        no_cmd_start_speed_thr = 0.45
+        no_cmd_start_yaw_thr = 0.80
+        no_cmd_start_tilt_thr = 0.50
         # 统一零指令判据阈值（所有 no_cmd 门控共用）
         no_cmd_planar_thr = 0.05
         no_cmd_yaw_thr = 0.05
@@ -189,8 +206,8 @@ class G1RoughCfg( LeggedRobotCfg ):
         terminate_contact_consecutive_steps = 2
         # num_observations = 47 + 160
         # num_privileged_obs = 50 + 160
-        num_observations = 798#本体感受历史(150) + planner对齐特征(8) + 视觉特征(640)
-        num_privileged_obs = 988#学生(798) + 局部高度采样(187) + 物理参数(3) = 988
+        num_observations = 808#本体感受历史(150) + planner轨迹切片特征(18) + 视觉特征(640)
+        num_privileged_obs = 998#学生(808) + 局部高度采样(187) + 物理参数(3) = 998
         
 
     # [恢复] 地形配置 (这对视觉训练很重要)
