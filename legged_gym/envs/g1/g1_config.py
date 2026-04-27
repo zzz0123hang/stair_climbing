@@ -61,7 +61,7 @@ class G1RoughCfg( LeggedRobotCfg ):
         # 平地随机角速度范围（_resample_commands 中使用）
         flat_yaw_range = 0.1
         # 平地零命令样本占比（受全局 no_cmd governor 约束）
-        flat_idle_prob = 0.06
+        flat_idle_prob = 0.08
         # 非零样本里前向牵引比例
         flat_forward_prob = 0.78
         # 楼梯牵引最小前进速度（过高会抑制交替稳定并提高摔倒率）
@@ -71,32 +71,32 @@ class G1RoughCfg( LeggedRobotCfg ):
         stair_idle_prob_early = 0.015
         stair_idle_prob_late = 0.005
         # 全局 no_cmd 比例目标带：主任务优先，同时保留静止能力
-        target_no_cmd_rate = 0.10
-        target_no_cmd_rate_low = 0.07
-        target_no_cmd_rate_high = 0.12
+        target_no_cmd_rate = 0.14
+        target_no_cmd_rate_low = 0.10
+        target_no_cmd_rate_high = 0.18
         # 楼梯牵引样本里的 no_cmd 硬上限（剩余 no_cmd 配额优先分给 flat）
         stair_idle_hard_cap_ratio = 0.02
         # 零指令动作抑制：保留少量动作余量，避免“完全锁死动作”导致平衡能力退化
-        no_cmd_action_scale = 0.06
+        no_cmd_action_scale = 0.08
         # 零指令恢复期动作上限：当仍有明显速度/偏航时临时放宽，先稳住再收紧
-        no_cmd_recover_action_scale = 0.16
+        no_cmd_recover_action_scale = 0.22
         no_cmd_recover_speed = 0.30
         no_cmd_recover_yaw_rate = 0.55
         # 零指令姿态反馈混合：仅在 no_cmd 下把动作轻度拉回 default 姿态
         no_cmd_pose_action_gain = 0.40
         no_cmd_pose_blend = 0.18
         no_cmd_pose_blend_settling = 0.35
-        no_cmd_pose_blend_hold = 0.50
+        no_cmd_pose_blend_hold = 0.35
         # HOLD 模式动作缩放（建议接近 0，优先锁定 default_dof_pos 站立）
-        no_cmd_hold_action_scale = 0.00
+        no_cmd_hold_action_scale = 0.12
         # RUN->HOLD 过渡态动作缩放，减小切换瞬间抖动
-        no_cmd_settling_action_scale = 0.08
+        no_cmd_settling_action_scale = 0.14
         # SETTLING 模式相位推进频率（0=不推进，仅靠控制收敛双支撑）
         no_cmd_settling_phase_rate = 0.00
         # 仅在“当前状态足够稳定”时才注入 no_cmd 样本，避免中途急刹导致摔倒重置
-        no_cmd_start_speed_thr = 0.45
-        no_cmd_start_yaw_thr = 0.80
-        no_cmd_start_tilt_thr = 0.50
+        no_cmd_start_speed_thr = 0.36
+        no_cmd_start_yaw_thr = 0.65
+        no_cmd_start_tilt_thr = 0.42
         # 统一零指令判据阈值（所有 no_cmd 门控共用）
         no_cmd_planar_thr = 0.05
         no_cmd_yaw_thr = 0.05
@@ -353,6 +353,12 @@ class G1RoughCfg( LeggedRobotCfg ):
         touchdown_side_ratio_max = 0.85
         # 低质量触地的兜底失活相位窗（防 planner active 长时间悬挂）
         touchdown_fallback_phase_max = 0.18
+        # 触地事件统计的最晚相位窗口（放宽后脚落地监督，避免第二只脚漏监督）
+        touchdown_phase_max = 0.82
+        # alternation 的双支撑事件最小垂向力阈值（过滤轻微抖动接触）
+        alternation_ds_min_fz = 6.0
+        # planner 触地事件的前进命令软门控底座（替代硬阈值屏蔽）
+        planner_touch_cmd_floor = 0.15
         
         class scales( LeggedRobotCfg.rewards.scales ):
             # --- 基础运动奖励 ---

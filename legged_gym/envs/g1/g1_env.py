@@ -1071,7 +1071,7 @@ class G1Robot(LeggedRobot):
         # 脚触地后关闭该脚激活标记：
         # 采用“摆动->支撑切换”事件（上一拍在摆动、本拍触地）立即失活，
         # 下一次离地事件会覆盖并重新写入新目标。
-        touchdown_raw = contact_now & self.foothold_prev_swing_mask & (self.leg_phase < 0.55)
+        touchdown_raw = contact_now & self.foothold_prev_swing_mask
         touchdown_valid = touchdown_raw & touchdown_quality
         # 兜底：若先发生侧碰等低质量接触，进入支撑早期后仍需结算旧目标，防止 active 悬挂太久。
         fallback_phase_max = float(getattr(self.cfg.rewards, "touchdown_fallback_phase_max", 0.18))
@@ -1533,7 +1533,7 @@ class G1Robot(LeggedRobot):
         # 稳定项：stand_still 已改为正向稳定分，课程后期与失稳阶段适度抬权
         safe_update(
             "stand_still",
-            0.24 + 0.14 * late_stage_progress_smooth + 0.12 * no_cmd_boost,
+            0.32 + 0.18 * late_stage_progress_smooth + 0.16 * no_cmd_boost,
             per_env=True
         )
         self.dynamic_base_height_target = 0.72 + 0.03 * float(global_progress.item())
@@ -1567,13 +1567,13 @@ class G1Robot(LeggedRobot):
         # 交替节奏项（解耦后独立课程）
         safe_update(
             "stair_alternation",
-            0.18 + 0.50 * late_stage_progress_smooth,
+            0.30 + 0.62 * late_stage_progress_smooth,
             per_env=True
         )
         # Planner 跟踪项（解耦后独立课程，略高于交替节奏，优先保证踩中预测点）
         safe_update(
             "planner_tracking",
-            0.52 + 0.63 * late_stage_progress_smooth,
+            0.45 + 0.50 * late_stage_progress_smooth,
             per_env=True
         )
         ###########
@@ -2204,6 +2204,9 @@ class G1Robot(LeggedRobot):
             visual_obs = torch.clamp(self.visual_obs_buf, 0.0, max_range) / max_range
         else:
             visual_obs = torch.zeros((self.num_envs, 640), device=self.device)
+        # 零指令下屏蔽视觉输入，避免场景纹理扰动把静止策略拉偏
+        if no_cmd_obs.any():
+            visual_obs[no_cmd_obs.squeeze(1)] = 0.0
 
         # 5. Planner 轨迹切片特征 (18 维):
         #    [dx,dy(4), dz_goal(2), z_err_now(2), phase_t(2), time_left(2), dz_start(2), conf(2), active(2)]
@@ -3505,8 +3508,15 @@ class G1Robot(LeggedRobot):
         touchdown_quality, _ = self._get_touchdown_contact_quality(contact_now)
         if not hasattr(self, "alt_prev_contact_feet"):
             self.alt_prev_contact_feet = torch.zeros((self.num_envs, self.feet_num), dtype=torch.bool, device=self.device)
-        touchdown_event = contact_now & (~self.alt_prev_contact_feet) & (self.leg_phase < 0.55) & touchdown_quality
-        touchdown_w = touchdown_event.float()
+        touchdown_event = contact_now & (~self.alt_prev_contact_feet) & touchdown_quality
+        touchdown_phase_max = float(getattr(self.cfg.rewards, "touchdown_phase_max", 0.82))
+        touchdown_phase_max = float(np.clip(touchdown_phase_max, 0.60, 0.98))
+        touchdown_phase_w = torch.clamp(
+            (touchdown_phase_max - self.leg_phase) / max(touchdown_phase_max, 1e-4),
+            min=0.0,
+            max=1.0,
+        )
+        touchdown_w = touchdown_event.float() * touchdown_phase_w
         touch_sigma = 0.045
         touch_err = torch.abs(dz_curr - dz_goal)
         touch_term = torch.exp(-torch.square(touch_err) / (2.0 * touch_sigma * touch_sigma)) \
@@ -3521,7 +3531,10 @@ class G1Robot(LeggedRobot):
             self.alt_prev_lead_sign = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
         if not hasattr(self, "alt_prev_ds_active"):
             self.alt_prev_ds_active = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
-        double_support = (contact_now[:, 0] & contact_now[:, 1]) & (self.leg_phase[:, 0] < 0.55) & (self.leg_phase[:, 1] < 0.55)
+        ds_min_fz = float(getattr(self.cfg.rewards, "alternation_ds_min_fz", 6.0))
+        ds_min_fz = float(np.clip(ds_min_fz, 1.2, 20.0))
+        force_z = self.contact_forces[:, self.feet_indices, 2]
+        double_support = (force_z[:, 0] > ds_min_fz) & (force_z[:, 1] > ds_min_fz)
         ds_event = double_support & (~(self.alt_prev_ds_active > 0.5))
         signed_z_diff = left_z - right_z
         lead_thr = torch.clamp(0.35 * step_h, min=0.02, max=0.07)
@@ -3697,14 +3710,22 @@ class G1Robot(LeggedRobot):
         touchdown_quality, _ = self._get_touchdown_contact_quality(contact_now)
         if not hasattr(self, "plan_track_prev_contact"):
             self.plan_track_prev_contact = torch.zeros((self.num_envs, self.feet_num), dtype=torch.bool, device=self.device)
-        touchdown_raw = contact_now & (~self.plan_track_prev_contact) & (self.leg_phase < 0.55)
+        touchdown_raw = contact_now & (~self.plan_track_prev_contact)
         touchdown_event = touchdown_raw & touchdown_quality
         side_hit_event = touchdown_raw & (~touchdown_quality)
         self.plan_track_prev_contact = contact_now
-        effective_cmd_mask = (cmd_forward_soft > 0.35)
-        touchdown_event = touchdown_event & effective_cmd_mask.unsqueeze(1)
-        side_hit_event = side_hit_event & effective_cmd_mask.unsqueeze(1)
-        touchdown_w = touchdown_event.float()
+        touchdown_phase_max = float(getattr(self.cfg.rewards, "touchdown_phase_max", 0.82))
+        touchdown_phase_max = float(np.clip(touchdown_phase_max, 0.60, 0.98))
+        touchdown_phase_w = torch.clamp(
+            (touchdown_phase_max - self.leg_phase) / max(touchdown_phase_max, 1e-4),
+            min=0.0,
+            max=1.0,
+        )
+        touch_cmd_floor = float(getattr(self.cfg.rewards, "planner_touch_cmd_floor", 0.15))
+        touch_cmd_floor = float(np.clip(touch_cmd_floor, 0.0, 1.0))
+        touch_cmd_w = (touch_cmd_floor + (1.0 - touch_cmd_floor) * cmd_forward_soft).unsqueeze(1)
+        touchdown_w = touchdown_event.float() * touchdown_phase_w * touch_cmd_w
+        side_hit_w = side_hit_event.float() * touchdown_phase_w * touch_cmd_w
 
         hit_thr = 0.12 - 0.07 * late      # 12cm -> 5cm
         pen_thr = 0.20 - 0.10 * late      # 20cm -> 10cm
@@ -3716,7 +3737,7 @@ class G1Robot(LeggedRobot):
             * touchdown_w * touch_task_w * (0.35 + 0.65 * plan_conf) * support_w
         touch_penalty = torch.clamp((xy_err - pen_thr) / 0.16, min=0.0, max=1.6) \
             * touchdown_w * touch_task_w * (0.35 + 0.65 * plan_conf) * touch_pen_w * penalty_soft_gate
-        side_hit_penalty = side_hit_event.float() * touch_task_w * penalty_soft_gate
+        side_hit_penalty = side_hit_w * touch_task_w * penalty_soft_gate
         support_touch_bonus = torch.clamp(
             torch.sum(touchdown_w * touch_task_w * support_conf, dim=1),
             min=0.0,
