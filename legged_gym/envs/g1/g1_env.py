@@ -987,6 +987,21 @@ class G1Robot(LeggedRobot):
         corners_h = self._get_feet_corner_heights(env_ids=env_ids)
         return corners_h.max(dim=-1).values
 
+    def _get_touchdown_contact_quality(self, contact_now):
+        """
+        触地质量过滤（用于规划失活和触地事件监督）：
+        - 要有足够垂向支撑力；
+        - 侧向冲击比例不能过高（避免踢台阶侧边被当成有效落地）。
+        """
+        forces = self.contact_forces[:, self.feet_indices, :]
+        force_xy = torch.norm(forces[:, :, :2], dim=2)
+        force_z = torch.clamp(forces[:, :, 2], min=0.0)
+        side_ratio = force_xy / (force_z + 1e-6)
+        min_fz = float(getattr(self.cfg.rewards, "touchdown_min_fz", 1.2))
+        side_ratio_max = float(getattr(self.cfg.rewards, "touchdown_side_ratio_max", 0.85))
+        quality = contact_now & (force_z > min_fz) & (side_ratio < side_ratio_max)
+        return quality, side_ratio
+
     def _update_foothold_planner(self):
         """
         统一落点规划器（事件触发，DS->SS 时锁存）：
@@ -1015,6 +1030,7 @@ class G1Robot(LeggedRobot):
 
         swing_start = 0.55
         contact_now = self.contact_forces[:, self.feet_indices, 2] > 1.2
+        touchdown_quality, _ = self._get_touchdown_contact_quality(contact_now)
         if not hasattr(self, "foothold_plan_prev_contact"):
             self.foothold_plan_prev_contact = contact_now.clone()
         liftoff_event = (~contact_now) & self.foothold_plan_prev_contact
@@ -1053,8 +1069,14 @@ class G1Robot(LeggedRobot):
             self.foothold_plan_target_xy[non_task_env] = self.feet_pos[non_task_env, :, :2]
             self.foothold_plan_target_z[non_task_env] = self.feet_pos[non_task_env, :, 2]
         # 脚触地后关闭该脚激活标记：
-        # 仅在“触地窗口(phase<0.30)”判定为稳定触地，避免摆动中途刮碰台阶边缘就提前失活。
-        touchdown_stable = contact_now & (self.leg_phase < 0.30)
+        # 采用“摆动->支撑切换”事件（上一拍在摆动、本拍触地）立即失活，
+        # 下一次离地事件会覆盖并重新写入新目标。
+        touchdown_raw = contact_now & self.foothold_prev_swing_mask & (self.leg_phase < 0.55)
+        touchdown_valid = touchdown_raw & touchdown_quality
+        # 兜底：若先发生侧碰等低质量接触，进入支撑早期后仍需结算旧目标，防止 active 悬挂太久。
+        fallback_phase_max = float(getattr(self.cfg.rewards, "touchdown_fallback_phase_max", 0.18))
+        touchdown_fallback = self.foothold_plan_active & contact_now & (self.leg_phase < fallback_phase_max)
+        touchdown_stable = touchdown_valid | touchdown_fallback
         self.foothold_plan_active = torch.where(
             touchdown_stable,
             torch.zeros_like(self.foothold_plan_active),
@@ -3480,9 +3502,10 @@ class G1Robot(LeggedRobot):
 
         # 触地事件：落地瞬间 z 差要接近 planner 目标 dz
         contact_now = self.contact_forces[:, self.feet_indices, 2] > 1.2
+        touchdown_quality, _ = self._get_touchdown_contact_quality(contact_now)
         if not hasattr(self, "alt_prev_contact_feet"):
             self.alt_prev_contact_feet = torch.zeros((self.num_envs, self.feet_num), dtype=torch.bool, device=self.device)
-        touchdown_event = contact_now & (~self.alt_prev_contact_feet) & (self.leg_phase < 0.30)
+        touchdown_event = contact_now & (~self.alt_prev_contact_feet) & (self.leg_phase < 0.55) & touchdown_quality
         touchdown_w = touchdown_event.float()
         touch_sigma = 0.045
         touch_err = torch.abs(dz_curr - dz_goal)
@@ -3671,12 +3694,16 @@ class G1Robot(LeggedRobot):
 
         # 2) 触地事件结算：仅在“有效 planner 任务”统计命中，避免无效样本稀释梯度
         contact_now = self.contact_forces[:, self.feet_indices, 2] > 1.2
+        touchdown_quality, _ = self._get_touchdown_contact_quality(contact_now)
         if not hasattr(self, "plan_track_prev_contact"):
             self.plan_track_prev_contact = torch.zeros((self.num_envs, self.feet_num), dtype=torch.bool, device=self.device)
-        touchdown_event = contact_now & (~self.plan_track_prev_contact) & (self.leg_phase < 0.30)
+        touchdown_raw = contact_now & (~self.plan_track_prev_contact) & (self.leg_phase < 0.55)
+        touchdown_event = touchdown_raw & touchdown_quality
+        side_hit_event = touchdown_raw & (~touchdown_quality)
         self.plan_track_prev_contact = contact_now
         effective_cmd_mask = (cmd_forward_soft > 0.35)
         touchdown_event = touchdown_event & effective_cmd_mask.unsqueeze(1)
+        side_hit_event = side_hit_event & effective_cmd_mask.unsqueeze(1)
         touchdown_w = touchdown_event.float()
 
         hit_thr = 0.12 - 0.07 * late      # 12cm -> 5cm
@@ -3689,6 +3716,7 @@ class G1Robot(LeggedRobot):
             * touchdown_w * touch_task_w * (0.35 + 0.65 * plan_conf) * support_w
         touch_penalty = torch.clamp((xy_err - pen_thr) / 0.16, min=0.0, max=1.6) \
             * touchdown_w * touch_task_w * (0.35 + 0.65 * plan_conf) * touch_pen_w * penalty_soft_gate
+        side_hit_penalty = side_hit_event.float() * touch_task_w * penalty_soft_gate
         support_touch_bonus = torch.clamp(
             torch.sum(touchdown_w * touch_task_w * support_conf, dim=1),
             min=0.0,
@@ -3697,11 +3725,18 @@ class G1Robot(LeggedRobot):
 
         touch_score = torch.clamp(torch.sum(touch_reward, dim=1), min=0.0, max=1.2)
         touch_pen_score = torch.clamp(torch.sum(touch_penalty, dim=1), min=0.0, max=1.6)
+        side_hit_pen_score = torch.clamp(torch.sum(side_hit_penalty, dim=1), min=0.0, max=1.8)
 
         # 前期轻罚、后期收紧，避免早期高误差阶段被大负项直接压死
         pen_gain = 0.10 + 0.90 * torch.clamp(late.squeeze(1), min=0.0, max=1.0)
         # 强化“触地命中预测点”主导，摆动连续项作为辅助。
-        raw_signal = 0.24 * swing_score + 0.88 * touch_score + 0.22 * support_touch_bonus - 1.10 * pen_gain * touch_pen_score
+        raw_signal = (
+            0.24 * swing_score
+            + 0.88 * touch_score
+            + 0.22 * support_touch_bonus
+            - 1.10 * pen_gain * touch_pen_score
+            - 0.45 * pen_gain * side_hit_pen_score
+        )
         explore_gate = self._get_explore_task_gate(default_weight=0.30)
         return torch.clamp(raw_signal, min=-1.2, max=1.4) * task_gate * explore_gate
 
@@ -4705,18 +4740,37 @@ class G1Robot(LeggedRobot):
         pitch_cost = torch.square(torch.clamp(pitch_abs - pitch_tol, min=0.0))
         tilt_cost = roll_cost + pitch_cost
         tilt_hard = ((roll_abs > roll_hard) | (pitch_abs > pitch_hard)).float()
+        # 2.1) 倾倒边界预防：接近终止阈值前就开始急剧增大代价，抑制 no_cmd 前后倾失稳
+        term_roll = max(float(getattr(self.cfg.env, "terminate_roll", 0.8)), 1e-3)
+        term_pitch = max(float(getattr(self.cfg.env, "terminate_pitch", 1.0)), 1e-3)
+        tilt_guard_ratio = float(np.clip(getattr(rewards_cfg, "stand_still_tilt_guard_ratio", 0.72), 0.40, 0.95))
+        roll_guard = torch.clamp(
+            (roll_abs - tilt_guard_ratio * term_roll) / max((1.0 - tilt_guard_ratio) * term_roll, 1e-4),
+            min=0.0,
+            max=1.5,
+        )
+        pitch_guard = torch.clamp(
+            (pitch_abs - tilt_guard_ratio * term_pitch) / max((1.0 - tilt_guard_ratio) * term_pitch, 1e-4),
+            min=0.0,
+            max=1.5,
+        )
+        tilt_guard_cost = torch.square(roll_guard) + torch.square(pitch_guard)
 
         # 3) 静止误差（站姿正确但仍然滑动/自转也要扣分）
         lin_speed = torch.norm(self.base_lin_vel[:, :2], dim=1)
         yaw_rate_abs = torch.abs(self.base_ang_vel[:, 2])
+        ang_vel_xy = torch.norm(self.base_ang_vel[:, :2], dim=1)
         lin_tol = float(getattr(rewards_cfg, "stand_still_lin_speed_tol", 0.05))
         yaw_tol = float(getattr(rewards_cfg, "stand_still_yaw_rate_tol", 0.10))
+        ang_xy_tol = float(getattr(rewards_cfg, "stand_still_ang_xy_tol", 0.20))
         lin_hard = float(getattr(rewards_cfg, "stand_still_lin_speed_hard", 0.20))
         yaw_hard = float(getattr(rewards_cfg, "stand_still_yaw_rate_hard", 0.35))
+        ang_xy_hard = float(getattr(rewards_cfg, "stand_still_ang_xy_hard", 0.65))
         lin_cost = torch.square(torch.clamp(lin_speed - lin_tol, min=0.0))
         yaw_cost = torch.square(torch.clamp(yaw_rate_abs - yaw_tol, min=0.0))
-        motion_cost = lin_cost + yaw_cost
-        motion_hard = ((lin_speed > lin_hard) | (yaw_rate_abs > yaw_hard)).float()
+        ang_xy_cost = torch.square(torch.clamp(ang_vel_xy - ang_xy_tol, min=0.0))
+        motion_cost = lin_cost + yaw_cost + 0.8 * ang_xy_cost
+        motion_hard = ((lin_speed > lin_hard) | (yaw_rate_abs > yaw_hard) | (ang_vel_xy > ang_xy_hard)).float()
 
         # 4) 双支撑约束：0 指令下明确偏好双脚同时支撑
         left_contact = self.contact_forces[:, self.feet_indices[0], 2] > 1.2
@@ -4729,8 +4783,10 @@ class G1Robot(LeggedRobot):
         posture_cost = (
             4.2 * joint_cost
             + 3.0 * tilt_cost
+            + 2.1 * tilt_guard_cost
             + 2.4 * lin_cost
             + 2.2 * yaw_cost
+            + 1.8 * ang_xy_cost
             + 2.2 * support_cost
         )
 
@@ -4744,8 +4800,9 @@ class G1Robot(LeggedRobot):
             + (pitch_abs > pitch_hard).float()
             + (lin_speed > lin_hard).float()
             + (yaw_rate_abs > yaw_hard).float()
+            + (ang_vel_xy > ang_xy_hard).float()
         )
-        hard_penalty = torch.clamp(hard_violation / 5.0, min=0.0, max=1.0)
+        hard_penalty = torch.clamp(hard_violation / 6.0, min=0.0, max=1.0)
         hard_penalty_scale = float(getattr(rewards_cfg, "stand_still_hard_penalty_scale", 0.12))
         hard_penalty_scale = float(np.clip(hard_penalty_scale, 0.0, 0.5))
         stand_score = torch.clamp(base_score - hard_penalty_scale * hard_penalty, min=0.0, max=1.0)
@@ -4804,7 +4861,13 @@ class G1Robot(LeggedRobot):
             yaw_abs = torch.abs(self.base_ang_vel[:, 2])
             speed_gate = torch.clamp(speed_xy / recover_speed, min=0.0, max=1.0)
             yaw_gate = torch.clamp(yaw_abs / recover_yaw, min=0.0, max=1.0)
-            recover_gate = torch.maximum(speed_gate, yaw_gate)
+            roll_abs = torch.abs(self.rpy[:, 0])
+            pitch_abs = torch.abs(self.rpy[:, 1])
+            term_roll = max(float(getattr(self.cfg.env, "terminate_roll", 0.8)), 1e-3)
+            term_pitch = max(float(getattr(self.cfg.env, "terminate_pitch", 1.0)), 1e-3)
+            tilt_norm = torch.maximum(roll_abs / term_roll, pitch_abs / term_pitch)
+            tilt_gate = torch.clamp((tilt_norm - 0.45) / 0.55, min=0.0, max=1.0)
+            recover_gate = torch.maximum(torch.maximum(speed_gate, yaw_gate), tilt_gate)
 
             action_scale = max(float(getattr(self.cfg.control, "action_scale", 0.25)), 1e-4)
             pose_action = torch.clamp(
@@ -4818,7 +4881,7 @@ class G1Robot(LeggedRobot):
                 run_gate = recover_gate[no_cmd_run_mask]
                 run_scale = no_cmd_scale + (no_cmd_recover_scale - no_cmd_scale) * run_gate
                 filtered_actions[no_cmd_run_mask] *= run_scale.unsqueeze(1)
-                run_blend = pose_blend * (1.0 - run_gate)
+                run_blend = pose_blend + (1.0 - pose_blend) * run_gate
                 filtered_actions[no_cmd_run_mask] = (
                     (1.0 - run_blend.unsqueeze(1)) * filtered_actions[no_cmd_run_mask]
                     + run_blend.unsqueeze(1) * pose_action[no_cmd_run_mask]
@@ -4827,7 +4890,7 @@ class G1Robot(LeggedRobot):
                 settling_gate = recover_gate[settling_mask]
                 settling_scale_env = settling_scale + (no_cmd_recover_scale - settling_scale) * settling_gate
                 filtered_actions[settling_mask] *= settling_scale_env.unsqueeze(1)
-                settling_blend = pose_blend_settling * (1.0 - 0.5 * settling_gate)
+                settling_blend = pose_blend_settling + (1.0 - pose_blend_settling) * 0.5 * settling_gate
                 filtered_actions[settling_mask] = (
                     (1.0 - settling_blend.unsqueeze(1)) * filtered_actions[settling_mask]
                     + settling_blend.unsqueeze(1) * pose_action[settling_mask]

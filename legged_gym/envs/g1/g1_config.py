@@ -340,9 +340,19 @@ class G1RoughCfg( LeggedRobotCfg ):
         stand_still_yaw_rate_tol = 0.10
         stand_still_lin_speed_hard = 0.20
         stand_still_yaw_rate_hard = 0.35
+        # no_cmd 站立附加防倾倒项：靠近终止阈值前提前增大代价
+        stand_still_tilt_guard_ratio = 0.72
+        # no_cmd 角速度(roll/pitch)容差与硬阈值
+        stand_still_ang_xy_tol = 0.20
+        stand_still_ang_xy_hard = 0.65
         stand_still_pose_sigma = 0.20
         # 软扣分强度：越小越不容易出现“为了避罚而主动重置”
         stand_still_hard_penalty_scale = 0.12
+        # 触地质量过滤：侧向冲击过大视为低质量触地（防踢台阶侧边误判）
+        touchdown_min_fz = 1.2
+        touchdown_side_ratio_max = 0.85
+        # 低质量触地的兜底失活相位窗（防 planner active 长时间悬挂）
+        touchdown_fallback_phase_max = 0.18
         
         class scales( LeggedRobotCfg.rewards.scales ):
             # --- 基础运动奖励 ---
