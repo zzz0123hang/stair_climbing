@@ -184,11 +184,16 @@ class G1RoughCfg( LeggedRobotCfg ):
             # alternation 解耦后分量诊断（dz vs switch）
             "Diagnostics/alt_dz_score_step",
             "Diagnostics/alt_switch_score_step",
+            "Diagnostics/alt_touch_hit_rate_step",
+            "Diagnostics/alt_touch_miss_pen_step",
             "Diagnostics/alt_switch_event_rate_step",
             # planner 核心闭环
             "Diagnostics/planner_xy_err_ema",
             "Diagnostics/planner_hit8_ema",
             "Diagnostics/planner_hit4_ema",
+            "Diagnostics/planner_touch_hit_rate_step",
+            "Diagnostics/planner_touch_miss_pen_step",
+            "Diagnostics/planner_touch_deep_pen_step",
             # reset 核心统计
             "Diagnostics/reset_rate_step",
             "Diagnostics/reset_reason_contact_share_cum",
@@ -354,11 +359,35 @@ class G1RoughCfg( LeggedRobotCfg ):
         # 低质量触地的兜底失活相位窗（防 planner active 长时间悬挂）
         touchdown_fallback_phase_max = 0.18
         # 触地事件统计的最晚相位窗口（放宽后脚落地监督，避免第二只脚漏监督）
-        touchdown_phase_max = 0.82
+        touchdown_phase_max = 0.95
+        # 触地相位软权重下限（避免落地稍晚时监督权重被压到接近 0）
+        touchdown_phase_floor = 0.35
         # alternation 的双支撑事件最小垂向力阈值（过滤轻微抖动接触）
         alternation_ds_min_fz = 6.0
+        # 交替中“同级跟随”惩罚：应上一级却落在同级/低级时扣分
+        alternation_follower_penalty_weight = 0.55
+        alternation_follower_min_dz = 0.04
         # planner 触地事件的前进命令软门控底座（替代硬阈值屏蔽）
-        planner_touch_cmd_floor = 0.15
+        planner_touch_cmd_floor = 0.30
+        # planner 触地命中阈值课程（米）：前期 8cm，后期收紧到 4cm
+        planner_hit_thr_early = 0.08
+        planner_hit_thr_late = 0.04
+        # planner 触地误差惩罚阈值课程（米）：前期 14cm，后期收紧到 7cm
+        planner_pen_thr_early = 0.14
+        planner_pen_thr_late = 0.07
+        # planner 触地点 miss / 踩太深惩罚权重
+        planner_touch_miss_penalty_weight = 1.25
+        planner_touch_deep_penalty_weight = 0.70
+        planner_touch_deep_margin = 0.015
+        # alternation 的换脚加分绑定到“先踩中预测点”
+        alternation_hit_thr_early = 0.08
+        alternation_hit_thr_late = 0.04
+        alternation_switch_require_hit_weight = 0.75
+        alternation_touch_miss_penalty_weight = 0.55
+        # clearance 前方立边预防惩罚权重（事前约束）
+        clearance_front_riser_penalty_weight = 0.38
+        clearance_swing_phase_min = 0.03
+        clearance_swing_phase_max = 0.99
         
         class scales( LeggedRobotCfg.rewards.scales ):
             # --- 基础运动奖励 ---
