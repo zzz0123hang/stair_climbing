@@ -1003,6 +1003,21 @@ class G1Robot(LeggedRobot):
         quality = contact_now & (force_z > min_fz) & (side_ratio < side_ratio_max)
         return quality, side_ratio
 
+    def _get_stable_touchdown_mask(self, contact_now):
+        """
+        稳定触地判定（用于 touchdown 结算）：
+        - 不是“第一次轻碰/擦边”；
+        - 需要更高垂向支撑 + 更低侧冲比。
+        """
+        forces = self.contact_forces[:, self.feet_indices, :]
+        force_xy = torch.norm(forces[:, :, :2], dim=2)
+        force_z = torch.clamp(forces[:, :, 2], min=0.0)
+        side_ratio = force_xy / (force_z + 1e-6)
+        stable_min_fz = float(getattr(self.cfg.rewards, "touchdown_stable_min_fz", 8.0))
+        stable_side_ratio_max = float(getattr(self.cfg.rewards, "touchdown_stable_side_ratio_max", 1.00))
+        stable = contact_now & (force_z > stable_min_fz) & (side_ratio < stable_side_ratio_max)
+        return stable
+
     def _update_foothold_planner(self):
         """
         统一落点规划器（事件触发，DS->SS 时锁存）：
@@ -1076,8 +1091,19 @@ class G1Robot(LeggedRobot):
         touchdown_valid = touchdown_raw & touchdown_quality
         # 兜底：若先发生侧碰等低质量接触，进入支撑早期后仍需结算旧目标，防止 active 悬挂太久。
         fallback_phase_max = float(getattr(self.cfg.rewards, "touchdown_fallback_phase_max", 0.18))
-        touchdown_fallback = self.foothold_plan_active & contact_now & (self.leg_phase < fallback_phase_max)
+        forces = self.contact_forces[:, self.feet_indices, :]
+        force_xy = torch.norm(forces[:, :, :2], dim=2)
+        force_z = torch.clamp(forces[:, :, 2], min=0.0)
+        side_ratio = force_xy / (force_z + 1e-6)
+        fallback_min_fz = float(getattr(self.cfg.rewards, "touchdown_fallback_min_fz", 8.0))
+        fallback_side_ratio_max = float(getattr(self.cfg.rewards, "touchdown_fallback_side_ratio_max", 1.40))
+        # fallback 只在“连续接触 + 一定承重 + 侧冲不过高”时触发，避免第一次轻擦边就提前失活
+        touchdown_fallback = self.foothold_plan_active & contact_now & self.foothold_plan_prev_contact & \
+            (self.leg_phase < fallback_phase_max) & (force_z > fallback_min_fz) & (side_ratio < fallback_side_ratio_max)
         touchdown_stable = touchdown_valid | touchdown_fallback
+        if hasattr(self, "extras"):
+            self.extras["Diagnostics/planner_fallback_event_rate_step"] = float(torch.mean(touchdown_fallback.float()).item())
+            self.extras["Diagnostics/planner_stable_touch_event_rate_step"] = float(torch.mean(touchdown_stable.float()).item())
         self.foothold_plan_active = torch.where(
             touchdown_stable,
             torch.zeros_like(self.foothold_plan_active),
@@ -1368,15 +1394,35 @@ class G1Robot(LeggedRobot):
             conf = torch.where(valid_plan_event, conf_raw, torch.zeros_like(conf_raw))
             top_out = top_out & valid_plan_event
 
-            # 这版按事件“直接写入当次规划结果”，避免旧目标残留干扰当前步态。
-            self.foothold_plan_target_xy[env_ids, swing_foot] = target_xy
-            self.foothold_plan_target_z[env_ids, swing_foot] = target_z
-            self.foothold_plan_start_xy[env_ids, swing_foot] = start_xy
-            self.foothold_plan_start_h[env_ids, swing_foot] = start_h
-            self.foothold_plan_riser_h[env_ids, swing_foot] = riser_h
+            # 仅有效 planner 事件写入目标，避免无效事件污染下一步 alternation/planner 监督。
+            prev_target_xy = self.foothold_plan_target_xy[env_ids, swing_foot]
+            prev_target_z = self.foothold_plan_target_z[env_ids, swing_foot]
+            prev_start_xy = self.foothold_plan_start_xy[env_ids, swing_foot]
+            prev_start_h = self.foothold_plan_start_h[env_ids, swing_foot]
+            prev_riser_h = self.foothold_plan_riser_h[env_ids, swing_foot]
+            valid_plan_event_2d = valid_plan_event.unsqueeze(1)
+            self.foothold_plan_target_xy[env_ids, swing_foot] = torch.where(
+                valid_plan_event_2d, target_xy, prev_target_xy
+            )
+            self.foothold_plan_target_z[env_ids, swing_foot] = torch.where(
+                valid_plan_event, target_z, prev_target_z
+            )
+            self.foothold_plan_start_xy[env_ids, swing_foot] = torch.where(
+                valid_plan_event_2d, start_xy, prev_start_xy
+            )
+            self.foothold_plan_start_h[env_ids, swing_foot] = torch.where(
+                valid_plan_event, start_h, prev_start_h
+            )
+            self.foothold_plan_riser_h[env_ids, swing_foot] = torch.where(
+                valid_plan_event, riser_h, prev_riser_h
+            )
             self.foothold_plan_edge_count[env_ids, swing_foot] = edge_count_final
-            self.foothold_plan_dz_goal[env_ids, swing_foot] = dz_goal
-            self.foothold_plan_dz_start[env_ids, swing_foot] = dz_start
+            self.foothold_plan_dz_goal[env_ids, swing_foot] = torch.where(
+                valid_plan_event, dz_goal, torch.zeros_like(dz_goal)
+            )
+            self.foothold_plan_dz_start[env_ids, swing_foot] = torch.where(
+                valid_plan_event, dz_start, torch.zeros_like(dz_start)
+            )
             self.foothold_plan_conf[env_ids, swing_foot] = conf
             self.foothold_plan_top_out[env_ids, swing_foot] = top_out
             self.foothold_plan_new_event[env_ids, swing_foot] = valid_plan_event
@@ -3432,8 +3478,9 @@ class G1Robot(LeggedRobot):
         has_plan_cache = hasattr(self, "foothold_plan_conf") and bool((self.foothold_plan_conf > 0.05).any().item())
         if hasattr(self, "foothold_plan_active") and (not bool(self.foothold_plan_active.any().item())) and (not has_plan_cache):
             contact_now = self.contact_forces[:, self.feet_indices, 2] > 1.2
+            stable_contact_now = self._get_stable_touchdown_mask(contact_now)
             if hasattr(self, "alt_prev_contact_feet"):
-                self.alt_prev_contact_feet = contact_now
+                self.alt_prev_contact_feet = stable_contact_now
             if hasattr(self, "alt_prev_ds_active"):
                 self.alt_prev_ds_active = torch.zeros_like(self.alt_prev_ds_active)
             if hasattr(self, "alt_prev_touch_sign"):
@@ -3508,12 +3555,16 @@ class G1Robot(LeggedRobot):
         dz_goal = self.foothold_plan_dz_goal if hasattr(self, "foothold_plan_dz_goal") else fallback_goal
         dz_start = self.foothold_plan_dz_start if hasattr(self, "foothold_plan_dz_start") else fallback_start
         plan_conf = self.foothold_plan_conf if hasattr(self, "foothold_plan_conf") else torch.ones_like(dz_goal)
+        if hasattr(self, "foothold_plan_active"):
+            plan_valid_w = self.foothold_plan_active.float() * (plan_conf > 0.05).float()
+        else:
+            plan_valid_w = (plan_conf > 0.05).float()
+        dz_goal = torch.where(plan_valid_w > 0.5, dz_goal, fallback_goal)
+        dz_start = torch.where(plan_valid_w > 0.5, dz_start, fallback_start)
 
         phase_t = torch.clamp((self.leg_phase - 0.55) / 0.45, min=0.0, max=1.0)
         swing_mask = (self.leg_phase > 0.55)
-        swing_plan_w = torch.ones((self.num_envs, self.feet_num), dtype=torch.float, device=self.device)
-        if hasattr(self, "foothold_plan_active"):
-            swing_plan_w = 0.20 + 0.80 * self.foothold_plan_active.float()
+        swing_plan_w = plan_valid_w
 
         # 每只脚相对另一只脚的实时 z 差
         left_z = self.feet_pos[:, 0, 2]
@@ -3531,10 +3582,10 @@ class G1Robot(LeggedRobot):
 
         # 触地事件：落地瞬间 z 差要接近 planner 目标 dz
         contact_now = self.contact_forces[:, self.feet_indices, 2] > 1.2
-        touchdown_quality, _ = self._get_touchdown_contact_quality(contact_now)
+        stable_contact_now = self._get_stable_touchdown_mask(contact_now)
         if not hasattr(self, "alt_prev_contact_feet"):
             self.alt_prev_contact_feet = torch.zeros((self.num_envs, self.feet_num), dtype=torch.bool, device=self.device)
-        touchdown_event = contact_now & (~self.alt_prev_contact_feet) & touchdown_quality
+        touchdown_event = stable_contact_now & (~self.alt_prev_contact_feet)
         touchdown_phase_max = float(getattr(self.cfg.rewards, "touchdown_phase_max", 0.95))
         touchdown_phase_max = float(np.clip(touchdown_phase_max, 0.60, 0.98))
         touchdown_phase_floor = float(getattr(self.cfg.rewards, "touchdown_phase_floor", 0.35))
@@ -3574,15 +3625,18 @@ class G1Robot(LeggedRobot):
         # 当 planner 目标要求有正高度差时，若触地后的 dz 仍明显偏低，则记惩罚。
         follower_min_dz = float(getattr(self.cfg.rewards, "alternation_follower_min_dz", 0.04))
         follower_min_dz = float(np.clip(follower_min_dz, 0.0, 0.20))
+        follower_target_ratio = float(getattr(self.cfg.rewards, "alternation_follower_target_ratio", 0.80))
+        follower_target_ratio = float(np.clip(follower_target_ratio, 0.30, 1.00))
         desired_up = torch.clamp(dz_goal, min=0.0)
         follower_active = (desired_up > follower_min_dz).float()
-        follower_denom = torch.clamp(0.55 * desired_up, min=max(0.008, 0.5 * follower_min_dz))
-        follower_gap = torch.clamp((0.55 * desired_up - dz_curr) / follower_denom, min=0.0, max=1.8)
+        follower_target = follower_target_ratio * desired_up
+        follower_denom = torch.clamp(follower_target, min=max(0.008, 0.5 * follower_min_dz))
+        follower_gap = torch.clamp((follower_target - dz_curr) / follower_denom, min=0.0, max=1.8)
         follower_pen_term = follower_gap * touchdown_w * follower_active * (0.35 + 0.65 * plan_conf)
         follower_pen_score = torch.clamp(torch.sum(follower_pen_term, dim=1), min=0.0, max=1.8)
 
         # 解耦：alternation 只负责节奏/高度，不再承担 XY 落点监督（由 planner_tracking 独占）。
-        self.alt_prev_contact_feet = contact_now
+        self.alt_prev_contact_feet = stable_contact_now
 
         # 触地切换事件（主监督）：触地脚别切换 + 命中预测点优先
         if not hasattr(self, "alt_prev_touch_sign"):
@@ -3690,8 +3744,9 @@ class G1Robot(LeggedRobot):
         has_plan_cache = hasattr(self, "foothold_plan_conf") and bool((self.foothold_plan_conf > 0.05).any().item())
         if hasattr(self, "foothold_plan_active") and (not bool(self.foothold_plan_active.any().item())) and (not has_plan_cache):
             contact_now = self.contact_forces[:, self.feet_indices, 2] > 1.2
+            stable_contact_now = self._get_stable_touchdown_mask(contact_now)
             if hasattr(self, "plan_track_prev_contact"):
-                self.plan_track_prev_contact = contact_now
+                self.plan_track_prev_contact = stable_contact_now
             return torch.zeros(self.num_envs, device=self.device)
 
         plan_env_active = torch.ones(self.num_envs, dtype=torch.float, device=self.device)
@@ -3752,6 +3807,10 @@ class G1Robot(LeggedRobot):
 
         plan_conf = self.foothold_plan_conf if hasattr(self, "foothold_plan_conf") else \
             torch.ones((self.num_envs, self.feet_num), device=self.device)
+        if hasattr(self, "foothold_plan_active"):
+            plan_valid_w = self.foothold_plan_active.float() * (plan_conf > 0.05).float()
+        else:
+            plan_valid_w = (plan_conf > 0.05).float()
         xy_err = torch.norm(self.feet_pos[:, :, :2] - self.foothold_plan_target_xy, dim=2)
         # 摆动轨迹跟踪统一放到 stair_clearance 内做（Z 主导 + 轻量 XY），
         # planner_tracking 只保留终点落足跟踪，避免双重监督冲突。
@@ -3789,9 +3848,7 @@ class G1Robot(LeggedRobot):
 
         # 1) 摆动期连续跟踪
         swing_mask = self.leg_phase > 0.55
-        swing_plan_w = torch.ones((self.num_envs, self.feet_num), dtype=torch.float, device=self.device)
-        if hasattr(self, "foothold_plan_active"):
-            swing_plan_w = 0.20 + 0.80 * self.foothold_plan_active.float()
+        swing_plan_w = plan_valid_w
         # 课程化：前期更宽松，后期收紧，减少早期因高误差长期负分而“学不动”
         late_prog = getattr(self, "current_late_stage_progress", 0.0)
         if torch.is_tensor(late_prog):
@@ -3806,13 +3863,14 @@ class G1Robot(LeggedRobot):
 
         # 2) 触地事件结算：仅在“有效 planner 任务”统计命中，避免无效样本稀释梯度
         contact_now = self.contact_forces[:, self.feet_indices, 2] > 1.2
+        stable_contact_now = self._get_stable_touchdown_mask(contact_now)
         touchdown_quality, _ = self._get_touchdown_contact_quality(contact_now)
         if not hasattr(self, "plan_track_prev_contact"):
             self.plan_track_prev_contact = torch.zeros((self.num_envs, self.feet_num), dtype=torch.bool, device=self.device)
-        touchdown_raw = contact_now & (~self.plan_track_prev_contact)
+        touchdown_raw = stable_contact_now & (~self.plan_track_prev_contact)
         touchdown_event = touchdown_raw & touchdown_quality
-        side_hit_event = touchdown_raw & (~touchdown_quality)
-        self.plan_track_prev_contact = contact_now
+        side_hit_event = (contact_now & (~stable_contact_now)) | (touchdown_raw & (~touchdown_quality))
+        self.plan_track_prev_contact = stable_contact_now
         touchdown_phase_max = float(getattr(self.cfg.rewards, "touchdown_phase_max", 0.95))
         touchdown_phase_max = float(np.clip(touchdown_phase_max, 0.60, 0.98))
         touchdown_phase_floor = float(getattr(self.cfg.rewards, "touchdown_phase_floor", 0.35))
@@ -4271,7 +4329,12 @@ class G1Robot(LeggedRobot):
         swing_phase_max = float(np.clip(swing_phase_max, 0.8, 1.0))
         is_swinging = ((t > swing_phase_min) & (t < swing_phase_max)).float()
         if hasattr(self, "foothold_plan_active"):
-            is_swinging = is_swinging * self.foothold_plan_active.float()
+            plan_active_w = self.foothold_plan_active.float()
+            if hasattr(self, "foothold_plan_conf"):
+                plan_active_w = torch.maximum(plan_active_w, (self.foothold_plan_conf > 0.05).float())
+            if hasattr(self, "foothold_plan_ttl_steps"):
+                plan_active_w = torch.maximum(plan_active_w, (self.foothold_plan_ttl_steps > 0).float())
+            is_swinging = is_swinging * plan_active_w
 
         # --- 2. 预测落足点 ---
         swing_duration_time = swing_duration_phase * gait_period
@@ -4310,12 +4373,23 @@ class G1Robot(LeggedRobot):
         raw_predicted_land_y = self.feet_pos[..., 1] + virtual_world_vel[:, 1].unsqueeze(1) * time_remaining
         predicted_land_xy = torch.stack([raw_predicted_land_x, raw_predicted_land_y], dim=-1)
         # 若 swing 开始已规划出落足锚点，则 clearance 全程跟踪该固定目标（不再每步漂移）
-        if hasattr(self, "foothold_plan_target_xy") and hasattr(self, "foothold_plan_active"):
+        if hasattr(self, "foothold_plan_target_xy"):
+            # 摆动期目标保持：优先使用 planner 锁存目标，避免轻碰后 active 短时掉线导致目标漂移。
+            if hasattr(self, "foothold_plan_active"):
+                plan_hold_mask = self.foothold_plan_active.clone()
+            else:
+                plan_hold_mask = torch.zeros((self.num_envs, self.feet_num), dtype=torch.bool, device=self.device)
+            if hasattr(self, "foothold_plan_conf"):
+                plan_hold_mask = plan_hold_mask | ((self.foothold_plan_conf > 0.05) & (self.leg_phase > swing_start))
             predicted_land_xy = torch.where(
-                self.foothold_plan_active.unsqueeze(-1),
+                plan_hold_mask.unsqueeze(-1),
                 self.foothold_plan_target_xy,
                 predicted_land_xy
             )
+        if hasattr(self, "foothold_plan_start_xy"):
+            xy_start_anchor = self.foothold_plan_start_xy
+        else:
+            xy_start_anchor = self.feet_pos[..., :2]
         predicted_land_x = predicted_land_xy[..., 0]
         predicted_land_y = predicted_land_xy[..., 1]
 
@@ -4489,7 +4563,91 @@ class G1Robot(LeggedRobot):
         # 基线轨迹：拔高后的基线 + 小弧线
         # 零指令时不再强行给固定抬腿弧高，减少“静止也被相位拉着摆腿”
         arc_amp = 0.004 * cmd_move_intent + 0.06 * step_up_diff + 0.30 * base_raise
-        base_traj_h = lifted_linear_h + arc_amp * sin_term
+        legacy_base_traj_h = lifted_linear_h + arc_amp * sin_term
+
+        # 多边缘相切基线：沿起终点连线检测所有上台阶边缘，
+        # 构造“经过每个边缘点且在边缘点处切线水平”的分段曲线。
+        tan_sample_num = int(getattr(self.cfg.rewards, "clearance_tangent_sample_num", 13))
+        tan_sample_num = int(np.clip(tan_sample_num, 5, 25))
+        # 默认覆盖“采样可见的全部上边缘”（而非只取前几个），满足多级边缘同时相切约束。
+        tan_max_edges = int(getattr(self.cfg.rewards, "clearance_tangent_max_edges", tan_sample_num - 1))
+        tan_max_edges = int(np.clip(tan_max_edges, 1, tan_sample_num - 1))
+        tan_margin = float(getattr(self.cfg.rewards, "clearance_tangent_edge_margin", 0.004))
+        tan_margin = float(np.clip(tan_margin, 0.0, 0.04))
+        tan_thr_cfg = float(getattr(self.cfg.rewards, "clearance_tangent_edge_thr", 0.012))
+        tan_thr_cfg = float(np.clip(tan_thr_cfg, 0.004, 0.08))
+        edge_h_thr = float(getattr(self.cfg.terrain, "edge_height_threshold", 0.03))
+        tan_edge_thr = float(np.clip(max(0.35 * edge_h_thr, tan_thr_cfg), 0.004, 0.08))
+
+        tan_alphas = torch.linspace(0.0, 1.0, tan_sample_num, device=self.device, dtype=torch.float)
+        tan_line_pts = xy_start_anchor.unsqueeze(2) + \
+            (predicted_land_xy - xy_start_anchor).unsqueeze(2) * tan_alphas.view(1, 1, tan_sample_num, 1)
+        tan_line_h = self._get_terrain_heights(
+            None,
+            tan_line_pts[..., 0].reshape(-1),
+            tan_line_pts[..., 1].reshape(-1),
+            interpolate=False
+        ).view(self.num_envs, self.feet_num, tan_sample_num)
+        tan_dh = tan_line_h[:, :, 1:] - tan_line_h[:, :, :-1]
+        tan_edge_mask = tan_dh > tan_edge_thr
+        tan_edge_cumsum = torch.cumsum(tan_edge_mask.int(), dim=2)
+        tan_keep = tan_edge_mask & (tan_edge_cumsum <= tan_max_edges)
+        tan_edge_count = torch.sum(tan_keep.float(), dim=2).long()
+
+        knot_size = tan_max_edges + 2
+        knot_t = torch.ones((self.num_envs, self.feet_num, knot_size), device=self.device, dtype=torch.float)
+        knot_h = torch.zeros((self.num_envs, self.feet_num, knot_size), device=self.device, dtype=torch.float)
+        knot_valid = torch.zeros((self.num_envs, self.feet_num, knot_size), device=self.device, dtype=torch.bool)
+        knot_t[:, :, 0] = 0.0
+        knot_h[:, :, 0] = current_terrain_h
+        knot_valid[:, :, 0] = True
+
+        tan_edge_alpha_all = tan_alphas[1:].view(1, 1, -1).expand(self.num_envs, self.feet_num, -1)
+        tan_edge_h_all = tan_line_h[:, :, 1:] + tan_margin
+        for j in range(1, tan_max_edges + 1):
+            sel = tan_keep & (tan_edge_cumsum == j)
+            has_j = sel.any(dim=2)
+            edge_t_j = torch.max(
+                torch.where(sel, tan_edge_alpha_all, torch.zeros_like(tan_edge_alpha_all)),
+                dim=2
+            ).values
+            edge_h_j = torch.max(
+                torch.where(sel, tan_edge_h_all, torch.full_like(tan_edge_h_all, -1e6)),
+                dim=2
+            ).values
+            knot_t[:, :, j] = torch.where(has_j, edge_t_j, knot_t[:, :, j])
+            knot_h[:, :, j] = torch.where(has_j, edge_h_j, knot_h[:, :, j])
+            knot_valid[:, :, j] = has_j
+
+        end_idx = torch.clamp(tan_edge_count + 1, min=1, max=knot_size - 1)
+        knot_slot = torch.arange(knot_size, device=self.device).view(1, 1, -1)
+        end_mask = knot_slot == end_idx.unsqueeze(-1)
+        knot_t = torch.where(end_mask, torch.ones_like(knot_t), knot_t)
+        knot_h = torch.where(end_mask, future_terrain_h.unsqueeze(-1), knot_h)
+        knot_valid = knot_valid | end_mask
+
+        pair_valid = knot_valid[:, :, :-1] & knot_valid[:, :, 1:]
+        seg_ids = torch.arange(knot_size - 1, device=self.device).view(1, 1, -1)
+        t_exp = t.unsqueeze(-1)
+        seg_mask = pair_valid & (t_exp >= knot_t[:, :, :-1]) & (t_exp <= (knot_t[:, :, 1:] + 1e-6))
+        seg_idx_default = torch.max(torch.where(pair_valid, seg_ids, torch.zeros_like(seg_ids)), dim=2).values.long()
+        seg_idx_hit = torch.max(torch.where(seg_mask, seg_ids, torch.zeros_like(seg_ids)), dim=2).values.long()
+        seg_idx = torch.where(seg_mask.any(dim=2), seg_idx_hit, seg_idx_default)
+
+        t0 = torch.gather(knot_t, 2, seg_idx.unsqueeze(-1)).squeeze(-1)
+        t1 = torch.gather(knot_t, 2, (seg_idx + 1).unsqueeze(-1)).squeeze(-1)
+        h0 = torch.gather(knot_h, 2, seg_idx.unsqueeze(-1)).squeeze(-1)
+        h1 = torch.gather(knot_h, 2, (seg_idx + 1).unsqueeze(-1)).squeeze(-1)
+        u = torch.clamp((t - t0) / torch.clamp(t1 - t0, min=1e-4), min=0.0, max=1.0)
+        ease = 3.0 * u * u - 2.0 * u * u * u
+        tangent_base_h = h0 + (h1 - h0) * ease
+        use_tangent = tan_edge_count > 0
+        base_traj_h = torch.where(
+            use_tangent,
+            torch.maximum(tangent_base_h, lifted_linear_h),
+            legacy_base_traj_h
+        )
+        edge_cross = torch.maximum(edge_cross, use_tangent.float())
         # 安全轨迹：在基线轨迹之上叠加安全余量（跨边/近立边时更高）
         safety_extra = torch.clamp(
             0.012 + 0.010 * edge_cross + 0.010 * front_edge_near_conf + 0.015 * front_riser_penalty,
@@ -4500,10 +4658,6 @@ class G1Robot(LeggedRobot):
 
         # --- 7. 轨迹跟踪打分（Z 主导 + XY 辅助） ---
         current_foot_h = self.feet_pos[..., 2]
-        if hasattr(self, "foothold_plan_start_xy"):
-            xy_start_anchor = self.foothold_plan_start_xy
-        else:
-            xy_start_anchor = self.feet_pos[..., :2]
         xy_traj = xy_start_anchor + (predicted_land_xy - xy_start_anchor) * t.unsqueeze(-1)
         xy_track_reward, xy_err_traj = self._clearance_xy_track_reward(
             self.feet_pos[..., :2], xy_traj, t

@@ -196,6 +196,8 @@ class G1RoughCfg( LeggedRobotCfg ):
             "Diagnostics/planner_touch_hit_rate_step",
             "Diagnostics/planner_touch_miss_pen_step",
             "Diagnostics/planner_touch_deep_pen_step",
+            "Diagnostics/planner_fallback_event_rate_step",
+            "Diagnostics/planner_stable_touch_event_rate_step",
             # reset 核心统计
             "Diagnostics/reset_rate_step",
             "Diagnostics/reset_reason_contact_share_cum",
@@ -358,8 +360,14 @@ class G1RoughCfg( LeggedRobotCfg ):
         # 触地质量过滤：侧向冲击过大视为低质量触地（防踢台阶侧边误判）
         touchdown_min_fz = 1.2
         touchdown_side_ratio_max = 0.85
+        # 稳定触地（用于奖励结算）：比 quality 更严格，避免第一下轻碰就结算
+        touchdown_stable_min_fz = 8.0
+        touchdown_stable_side_ratio_max = 1.00
         # 低质量触地的兜底失活相位窗（防 planner active 长时间悬挂）
         touchdown_fallback_phase_max = 0.18
+        # 兜底失活触发强度：避免“第一次轻擦边”就提前结算触地
+        touchdown_fallback_min_fz = 8.0
+        touchdown_fallback_side_ratio_max = 1.40
         # 触地事件统计的最晚相位窗口（放宽后脚落地监督，避免第二只脚漏监督）
         touchdown_phase_max = 0.95
         # 触地相位软权重下限（避免落地稍晚时监督权重被压到接近 0）
@@ -367,8 +375,9 @@ class G1RoughCfg( LeggedRobotCfg ):
         # alternation 的双支撑事件最小垂向力阈值（过滤轻微抖动接触）
         alternation_ds_min_fz = 6.0
         # 交替中“同级跟随”惩罚：应上一级却落在同级/低级时扣分
-        alternation_follower_penalty_weight = 0.55
+        alternation_follower_penalty_weight = 0.90
         alternation_follower_min_dz = 0.04
+        alternation_follower_target_ratio = 0.80
         # planner 触地事件的前进命令软门控底座（替代硬阈值屏蔽）
         planner_touch_cmd_floor = 0.30
         # planner 触地命中阈值课程（米）：前期 8cm，后期收紧到 4cm
@@ -397,6 +406,11 @@ class G1RoughCfg( LeggedRobotCfg ):
         clearance_xy_end_weight = 0.24
         clearance_xy_end_penalty_weight = 0.30
         clearance_xy_end_sigma = 0.045
+        # clearance 多边缘相切基线参数：有几条边缘就约束几个相切点
+        clearance_tangent_sample_num = 13
+        clearance_tangent_max_edges = 12
+        clearance_tangent_edge_margin = 0.004
+        clearance_tangent_edge_thr = 0.012
         # planner top-out 判据：前向一步内无明显上升才允许同级回退
         planner_top_out_h_margin = 0.018
         
