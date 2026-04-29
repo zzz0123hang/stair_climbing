@@ -184,6 +184,8 @@ class G1RoughCfg( LeggedRobotCfg ):
             # alternation 解耦后分量诊断（dz vs switch）
             "Diagnostics/alt_dz_score_step",
             "Diagnostics/alt_switch_score_step",
+            "Diagnostics/alt_touch_switch_score_step",
+            "Diagnostics/alt_ds_switch_score_step",
             "Diagnostics/alt_touch_hit_rate_step",
             "Diagnostics/alt_touch_miss_pen_step",
             "Diagnostics/alt_switch_event_rate_step",
@@ -384,10 +386,19 @@ class G1RoughCfg( LeggedRobotCfg ):
         alternation_hit_thr_late = 0.04
         alternation_switch_require_hit_weight = 0.75
         alternation_touch_miss_penalty_weight = 0.55
+        # 双支撑切换仅作为辅助监督，主监督由触地切换承担
+        alternation_ds_aux_weight = 0.30
         # clearance 前方立边预防惩罚权重（事前约束）
         clearance_front_riser_penalty_weight = 0.38
         clearance_swing_phase_min = 0.03
         clearance_swing_phase_max = 0.99
+        # clearance XY：全程轨迹约束 + 落地末段终点约束
+        clearance_xy_track_weight = 0.14
+        clearance_xy_end_weight = 0.24
+        clearance_xy_end_penalty_weight = 0.30
+        clearance_xy_end_sigma = 0.045
+        # planner top-out 判据：前向一步内无明显上升才允许同级回退
+        planner_top_out_h_margin = 0.018
         
         class scales( LeggedRobotCfg.rewards.scales ):
             # --- 基础运动奖励 ---

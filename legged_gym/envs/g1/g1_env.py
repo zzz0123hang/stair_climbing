@@ -416,6 +416,7 @@ class G1Robot(LeggedRobot):
         self.foothold_prev_swing_mask = torch.zeros((self.num_envs, self.feet_num), dtype=torch.bool, device=self.device)
         self.foothold_plan_prev_contact = torch.zeros((self.num_envs, self.feet_num), dtype=torch.bool, device=self.device)
         self.alt_prev_contact_feet = torch.zeros((self.num_envs, self.feet_num), dtype=torch.bool, device=self.device)
+        self.alt_prev_touch_sign = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
         # Planner 跟踪奖励事件缓存（与 alternation 解耦）
         self.plan_track_prev_contact = torch.zeros((self.num_envs, self.feet_num), dtype=torch.bool, device=self.device)
         # Planner 跟随质量诊断缓存（仅用于日志，不参与奖励）
@@ -1187,6 +1188,18 @@ class G1Robot(LeggedRobot):
             ).view(-1)
             support_h = torch.where(support_contact_now, support_h_now, support_h_plan)
             step_h = torch.clamp(self._get_step_height_target(env_ids=env_ids), min=0.05, max=0.20)
+            # top-out 判定：前向一个台阶宽度内若无明显上升，则视为“已到最高级/平台过渡”。
+            top_out_probe_dist = float(getattr(self.cfg.terrain, "stair_step_width", 0.30))
+            top_out_h_margin = float(getattr(self.cfg.rewards, "planner_top_out_h_margin", 0.018))
+            top_out_h_margin = float(np.clip(top_out_h_margin, 0.005, 0.06))
+            top_out_probe_xy = support_anchor_xy + dir_unit * top_out_probe_dist
+            top_out_probe_h = self._get_terrain_heights(
+                None,
+                top_out_probe_xy[:, 0],
+                top_out_probe_xy[:, 1],
+                interpolate=False
+            ).view(-1)
+            no_up_step_ahead = (top_out_probe_h - support_h) < top_out_h_margin
             level_diff_signed = support_h - swing_h
             same_level_thr = torch.clamp(0.30 * step_h, min=0.022, max=0.055)
             level_diff_eff = torch.where(
@@ -1278,8 +1291,10 @@ class G1Robot(LeggedRobot):
                 swing_lane_same_level_xy = swing_lane_xy.clone()
                 swing_lane_same_level_xy[:, 0] = torch.where(use_x_axis, support_same_level_axis, swing_lane_same_level_xy[:, 0])
                 swing_lane_same_level_xy[:, 1] = torch.where(~use_x_axis, support_same_level_axis, swing_lane_same_level_xy[:, 1])
+                allow_same_level_fallback = (~has_support_up_edge) & no_up_step_ahead
                 edge_xy = torch.where(has_support_up_edge.unsqueeze(1), swing_lane_edge_xy, swing_lane_same_level_xy)
                 has_exact = has_support_up_edge
+                top_out_event_local = (~has_support_up_edge) & allow_same_level_fallback
                 edge_count = torch.where(
                     has_support_up_edge,
                     torch.ones_like(desired_cross),
@@ -1306,6 +1321,7 @@ class G1Robot(LeggedRobot):
                 chosen_seg_idx = torch.argmax(chosen_mask.int(), dim=1)
                 edge_alpha = alphas[torch.clamp(chosen_seg_idx + 1, max=sample_num - 1)]
                 edge_xy = start_xy + (raw_target_xy - start_xy) * edge_alpha.unsqueeze(1)
+                top_out_event_local = (~has_exact) & no_up_step_ahead
 
             # rect 锚点修正：edge + 9cm（并夹到 rect 可行域）
             depth = torch.clamp(torch.full((len(env_ids),), target_depth, device=self.device), min=depth_min, max=depth_max)
@@ -1342,13 +1358,15 @@ class G1Robot(LeggedRobot):
             dz_goal = target_z - support_h
             support_z_ref = self.feet_pos[env_ids, support_foot, 2]
             dz_start = self.feet_pos[env_ids, swing_foot, 2] - support_z_ref
-            no_edge_current = (~has_exact)
-            top_out = no_edge_current & (desired_cross > 0)
+            top_out = top_out_event_local & (desired_cross > 0)
             conf_raw = torch.where(has_exact, torch.full_like(target_z, 0.95), torch.full_like(target_z, 0.72))
             task_env_local = planner_task_env[env_ids]
-            edge_count_final = torch.where(task_env_local, edge_count_final, torch.zeros_like(edge_count_final))
-            conf = torch.where(task_env_local, conf_raw, torch.zeros_like(conf_raw))
-            top_out = top_out & task_env_local
+            # 严格规则：仅“命中上一级边缘”或“确认 top-out”才视为有效 planner 事件；
+            # 禁止非 top-out 场景同级回退参与监督，避免把策略教成跟随步态。
+            valid_plan_event = task_env_local & (has_exact | top_out)
+            edge_count_final = torch.where(valid_plan_event, edge_count_final, torch.zeros_like(edge_count_final))
+            conf = torch.where(valid_plan_event, conf_raw, torch.zeros_like(conf_raw))
+            top_out = top_out & valid_plan_event
 
             # 这版按事件“直接写入当次规划结果”，避免旧目标残留干扰当前步态。
             self.foothold_plan_target_xy[env_ids, swing_foot] = target_xy
@@ -1361,10 +1379,10 @@ class G1Robot(LeggedRobot):
             self.foothold_plan_dz_start[env_ids, swing_foot] = dz_start
             self.foothold_plan_conf[env_ids, swing_foot] = conf
             self.foothold_plan_top_out[env_ids, swing_foot] = top_out
-            self.foothold_plan_new_event[env_ids, swing_foot] = task_env_local
-            self.foothold_plan_active[env_ids, swing_foot] = task_env_local
+            self.foothold_plan_new_event[env_ids, swing_foot] = valid_plan_event
+            self.foothold_plan_active[env_ids, swing_foot] = valid_plan_event
             ttl_vals = torch.where(
-                task_env_local,
+                valid_plan_event,
                 torch.full((len(env_ids),), swing_ttl_steps, dtype=torch.long, device=self.device),
                 torch.zeros((len(env_ids),), dtype=torch.long, device=self.device),
             )
@@ -3154,6 +3172,8 @@ class G1Robot(LeggedRobot):
             self.alt_prev_contact_feet[env_ids] = False
         if hasattr(self, "alt_prev_lead_sign"):
             self.alt_prev_lead_sign[env_ids] = 0.0
+        if hasattr(self, "alt_prev_touch_sign"):
+            self.alt_prev_touch_sign[env_ids] = 0.0
         if hasattr(self, "alt_same_lead_steps"):
             self.alt_same_lead_steps[env_ids] = 0.0
         if hasattr(self, "alt_prev_ds_active"):
@@ -3405,6 +3425,8 @@ class G1Robot(LeggedRobot):
             if hasattr(self, "extras"):
                 self.extras["Diagnostics/alt_dz_score_step"] = 0.0
                 self.extras["Diagnostics/alt_switch_score_step"] = 0.0
+                self.extras["Diagnostics/alt_touch_switch_score_step"] = 0.0
+                self.extras["Diagnostics/alt_ds_switch_score_step"] = 0.0
                 self.extras["Diagnostics/alt_switch_event_rate_step"] = 0.0
             return torch.zeros(self.num_envs, device=self.device)
         has_plan_cache = hasattr(self, "foothold_plan_conf") and bool((self.foothold_plan_conf > 0.05).any().item())
@@ -3414,9 +3436,13 @@ class G1Robot(LeggedRobot):
                 self.alt_prev_contact_feet = contact_now
             if hasattr(self, "alt_prev_ds_active"):
                 self.alt_prev_ds_active = torch.zeros_like(self.alt_prev_ds_active)
+            if hasattr(self, "alt_prev_touch_sign"):
+                self.alt_prev_touch_sign = torch.zeros_like(self.alt_prev_touch_sign)
             if hasattr(self, "extras"):
                 self.extras["Diagnostics/alt_dz_score_step"] = 0.0
                 self.extras["Diagnostics/alt_switch_score_step"] = 0.0
+                self.extras["Diagnostics/alt_touch_switch_score_step"] = 0.0
+                self.extras["Diagnostics/alt_ds_switch_score_step"] = 0.0
                 self.extras["Diagnostics/alt_switch_event_rate_step"] = 0.0
             return torch.zeros(self.num_envs, device=self.device)
 
@@ -3558,7 +3584,31 @@ class G1Robot(LeggedRobot):
         # 解耦：alternation 只负责节奏/高度，不再承担 XY 落点监督（由 planner_tracking 独占）。
         self.alt_prev_contact_feet = contact_now
 
-        # 双支撑切换事件：上一双支撑领先脚是否发生切换
+        # 触地切换事件（主监督）：触地脚别切换 + 命中预测点优先
+        if not hasattr(self, "alt_prev_touch_sign"):
+            self.alt_prev_touch_sign = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
+        touch_left = touchdown_w[:, 0] > 0.05
+        touch_right = touchdown_w[:, 1] > 0.05
+        touch_sign = torch.where(
+            touch_left & (~touch_right),
+            torch.ones_like(left_z),
+            torch.where(touch_right & (~touch_left), -torch.ones_like(left_z), torch.zeros_like(left_z))
+        )
+        prev_touch_sign = self.alt_prev_touch_sign
+        touch_switch_bonus = (touch_sign != 0.0) & (torch.abs(prev_touch_sign) > 0.5) & (touch_sign * prev_touch_sign < 0.0)
+        touch_same_pen = (touch_sign != 0.0) & (torch.abs(prev_touch_sign) > 0.5) & (touch_sign == prev_touch_sign)
+        touch_first = (touch_sign != 0.0) & (torch.abs(prev_touch_sign) <= 0.5)
+        touch_switch_hit_w = torch.clamp(touchdown_hit_env, min=0.0, max=1.0)
+        touch_no_hit_boost = 1.0 + 0.90 * (1.0 - touch_switch_hit_w)
+        touch_switch_score = (
+            0.95 * touch_switch_bonus.float() * touch_switch_hit_w
+            + 0.12 * touch_first.float() * touch_switch_hit_w
+            - 1.05 * touch_same_pen.float() * touch_no_hit_boost
+        )
+        next_touch_sign = torch.where(touch_sign != 0.0, touch_sign, prev_touch_sign)
+        self.alt_prev_touch_sign = next_touch_sign
+
+        # 双支撑切换事件（辅助监督）：保留小权重做节奏纠偏
         if not hasattr(self, "alt_prev_lead_sign"):
             self.alt_prev_lead_sign = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
         if not hasattr(self, "alt_prev_ds_active"):
@@ -3587,18 +3637,22 @@ class G1Robot(LeggedRobot):
         switch_hit_w = float(np.clip(switch_hit_w, 0.0, 1.0))
         switch_hit_gate = (1.0 - switch_hit_w) + switch_hit_w * touchdown_hit_env
         no_hit_pen_boost = 1.0 + 0.80 * (1.0 - touchdown_hit_env)
-        switch_score = (
+        ds_switch_score = (
             0.78 * switch_bonus.float() * switch_hit_gate
             + 0.12 * first_valid.float() * switch_hit_gate
             - 1.10 * same_pen.float() * no_switch_gain * no_hit_pen_boost
             - 0.42 * amb_pen.float() * no_switch_gain * no_hit_pen_boost
         )
-        switch_score = switch_score * plan_env_gate
+        ds_aux_w = float(getattr(self.cfg.rewards, "alternation_ds_aux_weight", 0.30))
+        ds_aux_w = float(np.clip(ds_aux_w, 0.0, 1.0))
+        ds_switch_score = ds_switch_score * ds_aux_w
+        switch_score = (touch_switch_score + ds_switch_score) * plan_env_gate
 
         inactive = (task_gate < 0.08)
         next_sign = torch.where(ds_event & (ds_sign != 0.0), ds_sign, prev_sign)
         self.alt_prev_lead_sign = torch.where(inactive, torch.zeros_like(next_sign), next_sign)
         self.alt_prev_ds_active = torch.where(inactive, torch.zeros_like(self.alt_prev_ds_active), double_support.float())
+        self.alt_prev_touch_sign = torch.where(inactive, torch.zeros_like(self.alt_prev_touch_sign), self.alt_prev_touch_sign)
 
         # 合成：仅使用 dz 连续项 + dz 触地项 + 换脚事件项
         dz_score = 0.40 * prog_score + 0.46 * touch_score
@@ -3614,6 +3668,8 @@ class G1Robot(LeggedRobot):
         if hasattr(self, "extras"):
             self.extras["Diagnostics/alt_dz_score_step"] = float(torch.mean(dz_score * alt_gate).item())
             self.extras["Diagnostics/alt_switch_score_step"] = float(torch.mean(switch_score * alt_gate).item())
+            self.extras["Diagnostics/alt_touch_switch_score_step"] = float(torch.mean(touch_switch_score * alt_gate).item())
+            self.extras["Diagnostics/alt_ds_switch_score_step"] = float(torch.mean(ds_switch_score * alt_gate).item())
             self.extras["Diagnostics/alt_follower_pen_step"] = float(torch.mean(follower_pen_score * alt_gate).item())
             self.extras["Diagnostics/alt_touch_hit_rate_step"] = float(torch.mean(touchdown_hit_env * alt_gate).item())
             self.extras["Diagnostics/alt_touch_miss_pen_step"] = float(torch.mean(touch_miss_score * alt_gate).item())
@@ -4163,8 +4219,7 @@ class G1Robot(LeggedRobot):
         xy_err = torch.norm(foot_xy - traj_xy, dim=2)
         xy_sigma = 0.060
         xy_reward = torch.exp(-torch.square(xy_err) / (2.0 * xy_sigma * xy_sigma))
-        xy_mid_gate = torch.clamp(torch.sin(phase_t * np.pi), min=0.0, max=1.0)
-        xy_reward = xy_reward * (0.35 + 0.65 * xy_mid_gate)
+        # 全时段等权：全过程都重要，不再只强调摆动中段。
         return xy_reward, xy_err
 
     def _clearance_z_track_reward(self, foot_h, base_traj_h, safe_traj_h, front_clear_gate):
@@ -4453,6 +4508,17 @@ class G1Robot(LeggedRobot):
         xy_track_reward, xy_err_traj = self._clearance_xy_track_reward(
             self.feet_pos[..., :2], xy_traj, t
         )
+        xy_end_err = torch.norm(self.feet_pos[..., :2] - predicted_land_xy, dim=2)
+        xy_end_sigma = float(getattr(self.cfg.rewards, "clearance_xy_end_sigma", 0.045))
+        xy_end_sigma = float(np.clip(xy_end_sigma, 0.02, 0.12))
+        xy_end_reward = torch.exp(-torch.square(xy_end_err) / (2.0 * xy_end_sigma * xy_end_sigma))
+        end_phase_gain = torch.clamp((t - 0.55) / 0.45, min=0.0, max=1.0)
+        end_phase_gain = torch.square(end_phase_gain)
+        xy_end_penalty = torch.clamp(
+            (xy_end_err - max(0.05, 1.3 * xy_end_sigma)) / 0.10,
+            min=0.0,
+            max=1.8
+        )
         z_track_reward, z_err_traj, below_base_penalty, above_safe_penalty = self._clearance_z_track_reward(
             current_foot_h, base_traj_h, safe_traj_h, front_clear_gate
         )
@@ -4526,7 +4592,17 @@ class G1Robot(LeggedRobot):
             - 0.18 * above_safe_penalty * penalty_gate * penalty_soft_gate
             - front_riser_pen_w * front_riser_penalty_term * penalty_gate * penalty_soft_gate
         )
-        clearance_signal_xy = 0.18 * xy_track_reward * reward_gate
+        xy_track_w = float(getattr(self.cfg.rewards, "clearance_xy_track_weight", 0.14))
+        xy_end_w = float(getattr(self.cfg.rewards, "clearance_xy_end_weight", 0.24))
+        xy_end_pen_w = float(getattr(self.cfg.rewards, "clearance_xy_end_penalty_weight", 0.30))
+        xy_track_w = float(np.clip(xy_track_w, 0.0, 1.0))
+        xy_end_w = float(np.clip(xy_end_w, 0.0, 1.0))
+        xy_end_pen_w = float(np.clip(xy_end_pen_w, 0.0, 1.5))
+        clearance_signal_xy = (
+            xy_track_w * xy_track_reward * reward_gate
+            + xy_end_w * xy_end_reward * end_phase_gain * reward_gate
+            - xy_end_pen_w * xy_end_penalty * end_phase_gain * penalty_gate * penalty_soft_gate
+        )
         clearance_signal = clearance_signal_z + clearance_signal_xy
 
         # 轨迹精度诊断（XY/Z 分开看）：仅在有效摆动样本上统计并做 EMA。
