@@ -162,46 +162,37 @@ class G1RoughCfg( LeggedRobotCfg ):
         # 关闭 Metrics/ 前缀全放行，避免地形曲线“全量展开”。
         wandb_extra_prefixes_keep = []
         wandb_extra_keys_keep = [
-            "metrics/full_contact_rate",
-            # Terrain（固定 6 条）
+            # Terrain（保留最小闭环）
             "Metrics/metrics_terrain_progress",
             "Metrics/mean_distance",
             "Metrics/mean_distance_final",
-            "Metrics/move_up_stair_nav_gate_rate",
             "Metrics/move_up_ready_rate",
             "Metrics/move_up_dist_gate_rate",
-            # no_cmd 核心稳定性
-            "Diagnostics/no_cmd_rate",
-            "Diagnostics/no_cmd_yaw_rate_mean",
-            "Diagnostics/no_cmd_instability_ema",
-            "Diagnostics/no_cmd_single_support_rate",
-            "Diagnostics/no_cmd_double_flight_rate",
-            "Diagnostics/move_double_flight_rate",
-            # stand_still 精简诊断
-            "Diagnostics/stand_score_no_cmd",
-            "Diagnostics/stand_motion_cost_no_cmd",
-            "Diagnostics/stand_double_support_rate_no_cmd",
-            # alternation 解耦后分量诊断（dz vs switch）
+            # 安全落足核心
+            "metrics/full_contact_rate",
+            "Diagnostics/clearance_xy_err_ema",
+            "Diagnostics/clearance_z_err_ema",
+            # alternation 主诊断（高度差 + 切换 + 命中）
             "Diagnostics/alt_dz_score_step",
             "Diagnostics/alt_switch_score_step",
-            "Diagnostics/alt_touch_switch_score_step",
-            "Diagnostics/alt_ds_switch_score_step",
             "Diagnostics/alt_touch_hit_rate_step",
             "Diagnostics/alt_touch_miss_pen_step",
-            "Diagnostics/alt_switch_event_rate_step",
-            # planner 核心闭环
+            "Diagnostics/alt_follower_cont_pen_step",
+            # planner 跟踪闭环
             "Diagnostics/planner_xy_err_ema",
             "Diagnostics/planner_hit8_ema",
             "Diagnostics/planner_hit4_ema",
             "Diagnostics/planner_touch_hit_rate_step",
             "Diagnostics/planner_touch_miss_pen_step",
+            "Diagnostics/planner_pre_touch_miss_pen_step",
             "Diagnostics/planner_touch_deep_pen_step",
+            "Diagnostics/planner_swing_attr_score_step",
+            "Diagnostics/planner_swing_far_pen_step",
+            "Diagnostics/planner_early_touch_pen_step",
             "Diagnostics/planner_fallback_event_rate_step",
             "Diagnostics/planner_stable_touch_event_rate_step",
-            # reset 核心统计
+            # reset 只留总率
             "Diagnostics/reset_rate_step",
-            "Diagnostics/reset_reason_contact_share_cum",
-            "Diagnostics/reset_reason_pose_share_cum",
         ]
         # Play 手动控制模式：开启后，环境不再覆盖外部下发的速度/角速度指令
         manual_cmd_override = False
@@ -215,8 +206,8 @@ class G1RoughCfg( LeggedRobotCfg ):
         terminate_contact_consecutive_steps = 2
         # num_observations = 47 + 160
         # num_privileged_obs = 50 + 160
-        num_observations = 808#本体感受历史(150) + planner轨迹切片特征(18) + 视觉特征(640)
-        num_privileged_obs = 998#学生(808) + 局部高度采样(187) + 物理参数(3) = 998
+        num_observations = 802#本体感受历史(150) + planner轨迹切片特征(12) + 视觉特征(640)
+        num_privileged_obs = 992#学生(802) + 局部高度采样(187) + 物理参数(3) = 992
         
 
     # [恢复] 地形配置 (这对视觉训练很重要)
@@ -225,7 +216,7 @@ class G1RoughCfg( LeggedRobotCfg ):
         curriculum = True
         # mesh_type = 'plane'
         # curriculum = True 
-        horizontal_scale = 0.1 # [m]
+        horizontal_scale = 0.1 # [m]  # 从0.1改为0.05，提高地形精度
         vertical_scale = 0.005 # [m]
         border_size = 25 # [m]
 
@@ -253,17 +244,17 @@ class G1RoughCfg( LeggedRobotCfg ):
         # 升级距离阈值：保持严格标准，要求接近完成一段完整上坡推进
         curriculum_move_up_distance = 4.5
         # 升级还需满足 final_distance > move_up_distance * ratio（抗推搡误升）
-        curriculum_move_up_final_ratio = 0.76
+        curriculum_move_up_final_ratio = 0.82
         # 降级距离阈值（终点位移）
         curriculum_move_down_distance = 1.0
         # 降级还需满足 max_distance < move_up_distance * ratio（防“有推进却回摆”误降）
         curriculum_move_down_max_ratio = 0.55
-        # 当前为纯楼梯金字塔地形，先关闭 stair_conf 升级门控，简化课程判据
-        curriculum_move_up_stair_conf = 0.0
+        # 重新启用 stair_conf 升级门控，避免“推进距离够了就过早升难度”
+        curriculum_move_up_stair_conf = 0.22
         # 峰值兜底阈值
         curriculum_move_up_stair_conf_peak = 0.52
         # 最少导航步数，避免偶发短时暴露触发误升
-        curriculum_move_up_nav_steps_min = 56
+        curriculum_move_up_nav_steps_min = 36  # 降低导航步数要求，促进升级
         num_rows= 10 
         num_cols = 20 
         # num_rows= 5 
@@ -358,42 +349,59 @@ class G1RoughCfg( LeggedRobotCfg ):
         # 软扣分强度：越小越不容易出现“为了避罚而主动重置”
         stand_still_hard_penalty_scale = 0.12
         # 触地质量过滤：侧向冲击过大视为低质量触地（防踢台阶侧边误判）
-        touchdown_min_fz = 1.2
+        touchdown_min_fz = 20.0  # 统一触地力阈值
         touchdown_side_ratio_max = 0.85
         # 稳定触地（用于奖励结算）：比 quality 更严格，避免第一下轻碰就结算
-        touchdown_stable_min_fz = 8.0
+        touchdown_stable_min_fz = 20.0  # 统一触地力阈值
         touchdown_stable_side_ratio_max = 1.00
+        # touchdown 连续帧确认步数：防单帧轻碰/噪声误触发
+        touchdown_confirm_steps = 2
         # 低质量触地的兜底失活相位窗（防 planner active 长时间悬挂）
         touchdown_fallback_phase_max = 0.18
-        # 兜底失活触发强度：避免“第一次轻擦边”就提前结算触地
-        touchdown_fallback_min_fz = 8.0
+        # 兜底失活触发强度：避免"第一次轻擦边"就提前结算触地
+        touchdown_fallback_min_fz = 20.0  # 统一触地力阈值
         touchdown_fallback_side_ratio_max = 1.40
         # 触地事件统计的最晚相位窗口（放宽后脚落地监督，避免第二只脚漏监督）
         touchdown_phase_max = 0.95
         # 触地相位软权重下限（避免落地稍晚时监督权重被压到接近 0）
         touchdown_phase_floor = 0.35
         # alternation 的双支撑事件最小垂向力阈值（过滤轻微抖动接触）
-        alternation_ds_min_fz = 6.0
+        alternation_ds_min_fz = 20.0  # 统一触地力阈值
         # 交替中“同级跟随”惩罚：应上一级却落在同级/低级时扣分
-        alternation_follower_penalty_weight = 0.90
+        alternation_follower_penalty_weight = 0.90  # 降低 follower 惩罚，促进交替步态学习
+        alternation_follower_continuous_weight = 0.45
         alternation_follower_min_dz = 0.04
-        alternation_follower_target_ratio = 0.80
+        alternation_follower_target_ratio = 0.90
         # planner 触地事件的前进命令软门控底座（替代硬阈值屏蔽）
         planner_touch_cmd_floor = 0.30
-        # planner 触地命中阈值课程（米）：前期 8cm，后期收紧到 4cm
-        planner_hit_thr_early = 0.08
-        planner_hit_thr_late = 0.04
-        # planner 触地误差惩罚阈值课程（米）：前期 14cm，后期收紧到 7cm
-        planner_pen_thr_early = 0.14
-        planner_pen_thr_late = 0.07
+        # planner 触地命中阈值课程（米）：前期 10cm，后期收紧到 5cm（配合horizontal_scale=0.05）
+        planner_hit_thr_early = 0.10
+        planner_hit_thr_late = 0.05
+        # planner 触地误差惩罚阈值课程（米）：前期 16cm，后期收紧到 10cm
+        planner_pen_thr_early = 0.16
+        planner_pen_thr_late = 0.10
         # planner 触地点 miss / 踩太深惩罚权重
-        planner_touch_miss_penalty_weight = 1.25
+        planner_touch_miss_penalty_weight = 1.00  # 降低触地 miss 惩罚
+        planner_pre_touch_miss_penalty_weight = 0.20  # 大幅降低 pre_touch 惩罚，解决 hit_rate 极低问题
         planner_touch_deep_penalty_weight = 0.70
         planner_touch_deep_margin = 0.015
+        # planner 连续吸引（基于归一化目标距离）：全程吸引 + 后半程增强
+        planner_attr_sigma_norm_early = 0.90
+        planner_attr_sigma_norm_late = 0.35
+        planner_attr_phase_floor = 0.25
+        planner_attr_phase_boost_start = 0.55
+        planner_attr_far_thr_norm_early = 0.95
+        planner_attr_far_thr_norm_late = 0.45
+        planner_attr_far_penalty_weight = 0.32
+        # 过早稳定触地惩罚：抑制脚尖先挂边/早落地
+        planner_early_touch_phase = 0.66
+        planner_early_touch_penalty_weight = 0.40  # 降低早期触地惩罚
         # alternation 的换脚加分绑定到“先踩中预测点”
-        alternation_hit_thr_early = 0.08
-        alternation_hit_thr_late = 0.04
+        alternation_hit_thr_early = 0.10  # 统一为与planner一致的粗监督
+        alternation_hit_thr_late = 0.05
         alternation_switch_require_hit_weight = 0.75
+        # 交替奖励中“换脚切换项”总权重（放大后减少“只靠 dz 项拿分”）
+        alternation_switch_score_weight = 1.20
         alternation_touch_miss_penalty_weight = 0.55
         # 双支撑切换仅作为辅助监督，主监督由触地切换承担
         alternation_ds_aux_weight = 0.30
@@ -402,10 +410,17 @@ class G1RoughCfg( LeggedRobotCfg ):
         clearance_swing_phase_min = 0.03
         clearance_swing_phase_max = 0.99
         # clearance XY：全程轨迹约束 + 落地末段终点约束
-        clearance_xy_track_weight = 0.14
+        # 课程化 sigma：前期宽松，后期收紧
+        clearance_xy_sigma_early = 0.085
+        clearance_xy_sigma_late = 0.045
+        clearance_xy_track_weight = 0.18
         clearance_xy_end_weight = 0.24
-        clearance_xy_end_penalty_weight = 0.30
+        clearance_xy_end_penalty_weight = 0.36
         clearance_xy_end_sigma = 0.045
+        clearance_xy_end_sigma_early = 0.060
+        clearance_xy_end_sigma_late = 0.035
+        # XY 监督归属：False=由 planner_tracking 独占 XY，clearance 专注 Z
+        clearance_use_xy_supervision = False
         # clearance 多边缘相切基线参数：有几条边缘就约束几个相切点
         clearance_tangent_sample_num = 13
         clearance_tangent_max_edges = 12

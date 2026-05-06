@@ -1611,14 +1611,10 @@ class G1Robot(LeggedRobot):
         safe_update("tracking_ang_vel", 1.10 + 0.10 * terrain_progress, per_env=True)
         safe_update("contact", 0.10 - 0.02 * late_stage_progress_smooth, per_env=True)
         # 保持“敢迈第一步”信号到中后期，减少台阶前停顿等待
-        safe_update(
-            "first_step_commit",
-            0.32 + 0.16 * (1.0 - late_stage_progress_smooth) + 0.06 * planner_miss_boost,
-            per_env=True
-        )
+        safe_update("first_step_commit", 0.80 * (1.0 - late_stage_progress_smooth), per_env=True)
         safe_update("lin_vel_z", -0.82 + 0.10 * late_stage_progress_smooth, per_env=True)
         # 动作变化率渐进约束：前期更松便于学会推进，后期再抑制抖动/拖步
-        safe_update("action_rate", -0.012 - 0.020 * late_stage_progress_smooth, per_env=True)
+        safe_update("action_rate", -0.005 + 0.003 * late_stage_progress_smooth, per_env=True)
         # 台阶安全专项：保持主导但避免压过速度/姿态主任务
         safe_update("foot_support_rect", 0.06 + 0.24 * torch.pow(late_stage_progress_smooth, 1.35), per_env=True)
         safe_update(
@@ -2272,40 +2268,52 @@ class G1Robot(LeggedRobot):
         if no_cmd_obs.any():
             visual_obs[no_cmd_obs.squeeze(1)] = 0.0
 
-        # 5. Planner 轨迹切片特征 (18 维):
-        #    [dx,dy(4), dz_goal(2), z_err_now(2), phase_t(2), time_left(2), dz_start(2), conf(2), active(2)]
-        planner_obs = torch.zeros((self.num_envs, 18), device=self.device)
+        # 5. Planner 轨迹切片特征 (12 维精简版):
+        #    [落点误差坐标(6)=目标-脚位置(xyz), 目标高度差(2), 摆动进度(2), 激活状态(2)]
+        planner_obs = torch.zeros((self.num_envs, 12), device=self.device)
         if hasattr(self, "foothold_plan_target_xy") and hasattr(self, "feet_pos"):
-            plan_delta_w = self.foothold_plan_target_xy - self.feet_pos[:, :, :2]  # (N,2,2)
             yaw = self.rpy[:, 2]
             cos_yaw = torch.cos(yaw).unsqueeze(1)
             sin_yaw = torch.sin(yaw).unsqueeze(1)
-            dx_b = cos_yaw * plan_delta_w[:, :, 0] + sin_yaw * plan_delta_w[:, :, 1]
-            dy_b = -sin_yaw * plan_delta_w[:, :, 0] + cos_yaw * plan_delta_w[:, :, 1]
-            plan_delta_b = torch.stack([dx_b, dy_b], dim=-1)
-            # 归一化到网络友好范围，同时放宽饱和区间，减少“大误差全一样”导致的跟踪分辨率损失
-            planner_obs[:, :4] = torch.clamp(plan_delta_b, min=-1.20, max=1.20).reshape(self.num_envs, -1) * (1.0 / 1.20)
-            if hasattr(self, "foothold_plan_dz_goal"):
-                planner_obs[:, 4:6] = torch.clamp(self.foothold_plan_dz_goal, min=-0.35, max=0.35) * 2.0
+            
+            # 【核心】落点误差 = 目标 - 当前脚位置（相对机体坐标系）
+            # XY误差转机体坐标系
+            error_xy_w = self.foothold_plan_target_xy - self.feet_pos[:, :, :2]  # (N,2,2)
+            error_x_b = cos_yaw * error_xy_w[:, :, 0] + sin_yaw * error_xy_w[:, :, 1]
+            error_y_b = -sin_yaw * error_xy_w[:, :, 0] + cos_yaw * error_xy_w[:, :, 1]
+            error_xy_b = torch.stack([error_x_b, error_y_b], dim=-1)  # (N, 2, 2)
+            
+            # Z误差：目标高度 - 当前脚高度
             if hasattr(self, "foothold_plan_target_z"):
-                z_err_now = self.feet_pos[:, :, 2] - self.foothold_plan_target_z
-                planner_obs[:, 6:8] = torch.clamp(z_err_now, min=-0.30, max=0.30) * 3.0
+                error_z = self.foothold_plan_target_z.unsqueeze(-1) - self.feet_pos[:, :, 2:3]  # (N, 2, 1)
+            else:
+                error_z = torch.zeros((self.num_envs, 2, 1), device=self.device)
+            
+            # 合并XYZ误差 (N, 2, 3)
+            error_xyz = torch.cat([error_xy_b, error_z], dim=-1)
+            
+            # XY归一化用1.2m尺度，Z归一化用0.4m尺度
+            planner_obs[:, :4] = torch.clamp(error_xy_b.reshape(self.num_envs, -1), min=-1.20, max=1.20) * (1.0 / 1.20)
+            planner_obs[:, 4:6] = torch.clamp(error_z.squeeze(-1), min=-0.40, max=0.40) * (1.0 / 0.40)
+            
+            # 目标高度差 (dz_goal)
+            if hasattr(self, "foothold_plan_dz_goal"):
+                planner_obs[:, 6:8] = torch.clamp(self.foothold_plan_dz_goal, min=-0.35, max=0.35) * 2.0
+            
+            # 摆动进度 (phase_t)
             swing_start = 0.55
             swing_duration_phase = 1.0 - swing_start
             phase_t = torch.clamp((self.leg_phase - swing_start) / swing_duration_phase, min=0.0, max=1.0)
             planner_obs[:, 8:10] = phase_t * 2.0 - 1.0
-            time_left_norm = 1.0 - phase_t
-            planner_obs[:, 10:12] = time_left_norm * 2.0 - 1.0
-            if hasattr(self, "foothold_plan_dz_start"):
-                planner_obs[:, 12:14] = torch.clamp(self.foothold_plan_dz_start, min=-0.35, max=0.35) * 2.0
-            if hasattr(self, "foothold_plan_conf"):
-                planner_obs[:, 14:16] = torch.clamp(self.foothold_plan_conf, min=0.0, max=1.0)
+            
+            # 激活状态 (active)
             if hasattr(self, "foothold_plan_active"):
-                planner_obs[:, 16:18] = self.foothold_plan_active.float()
+                planner_obs[:, 10:12] = self.foothold_plan_active.float()
+            
             if no_cmd_obs.any():
                 planner_obs[no_cmd_obs.squeeze(1)] = 0.0
 
-        # 6. 【组装学生观测】 (150 + 18 + 640 = 808 维)
+        # 6. 【组装学生观测】 (150 + 24 + 640 = 814 维)
         # 注意：保持最后 640 维是视觉输入，兼容 ActorCriticTS 的视觉切片逻辑。
         self.obs_buf = torch.cat((self.obs_history_buf, planner_obs, visual_obs), dim=-1)
 

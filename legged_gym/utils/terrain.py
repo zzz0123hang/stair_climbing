@@ -29,7 +29,7 @@ class Terrain:
 
         self.height_field_raw = np.zeros((self.tot_rows , self.tot_cols), dtype=np.int16)
         if cfg.curriculum:
-            self.curiculum()
+            self.curriculum()
         elif cfg.selected:
             self.selected_terrain()
         else:    
@@ -142,7 +142,7 @@ class Terrain:
             terrain = self.make_terrain(choice, difficulty, row_idx=i)
             self.add_terrain_to_map(terrain, i, j)
         
-    def curiculum(self):
+    def curriculum(self):
         for j in range(self.cfg.num_cols):
             for i in range(self.cfg.num_rows):
                 difficulty = i / self.cfg.num_rows
